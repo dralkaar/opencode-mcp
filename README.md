@@ -2,13 +2,76 @@
 
 **English** | [中文](README.zh-CN.md)
 
-An MCP (Model Context Protocol) stdio server implemented in the **pure Python 3 standard library**, for driving **opencode** conversations programmatically: create sessions, send prompts, wait for replies, handle permission requests and forms, compact context, and manage multiple opencode servers.
+## Why this exists
 
-Zero third-party dependencies. All capabilities are live-tested against opencode v2.0.12, including a real remote end-to-end run.
+Until agents commonly speak ACP (Agent Client Protocol) directly to opencode, driving opencode over its **HTTP API** through MCP is the best available route for an agent to operate opencode — and this server is built for exactly that: every tool maps to a clean, machine-consumable state machine (authoritative terminal states, blocking interaction states, incremental cursors) rather than a UI replica, which makes it a native fit for agent orchestration.
 
-## Design in one paragraph
+Tested in real use with:
 
-MCP is a stdio JSON-RPC 2.0 server (newline-delimited, not LSP Content-Length framing). It speaks to opencode's HTTP API over a connection layer. Local opencode is either connected explicitly via `OPENCODE_URL` or **spawned by the MCP itself** (random high port, random password, child process lifetime). Remote opencode instances are registered dynamically with `connect_server` and addressed by alias; sessions remember which connection they live on and route automatically. Terminal states are judged solely from the authoritative `Session.outcome` field — never from message-shape heuristics.
+- **opencode v2.0.12** — the development baseline; every capability is live-verified against it
+- **a real remote instance** — full end-to-end over the network (connect → create → chat → manual permission → reply → wait → incremental fetch → disconnect)
+- **the Hermes agent gateway** — mounted as a tool provider and used in production
+- **the oh-my-opencode-slim agent orchestration framework** — hosts the MCP and drives nested opencode sessions through it
+
+## Scope
+
+This is **not** a complete control surface for every aspect of opencode, and it does not try to be. It is deliberately scoped to what an agent actually needs for day-to-day opencode interaction:
+
+- create and resume sessions, send prompts, collect results
+- handle the two blocking interactions — permission requests and forms
+- manage context (usage inspection, compaction) and session lifecycle
+- route across multiple opencode servers (local and remote)
+
+Management-plane surfaces — filesystem, credentials, providers, plugins, terminals, config — are intentionally out of scope. Fewer tools, sharper semantics, less to get wrong.
+
+## Install with your LLM
+
+Paste this into your coding agent:
+
+```text
+Install and register opencode-mcp for me:
+
+1. Clone: git clone https://github.com/yitro-z-wang/opencode-mcp ~/opencode-mcp
+2. Verify: run `python3 ~/opencode-mcp/test_client.py` — it must report 16 tools and pass.
+3. Register with opencode: `opencode mcp add opencode-local -- python3 ~/opencode-mcp/server.py`
+4. Reload opencode config, then start a new session and confirm the 16 opencode-local tools are available.
+
+Requirements: Python 3.10+ and the opencode CLI on PATH (v2.0.12 is the development baseline).
+Report any errors verbatim; do not retry blindly.
+```
+
+## Features
+
+- **Zero dependencies** — pure Python 3 standard library, one file, no build step.
+- **Multi-server** — MCP-spawned local serve (random port + random password, dies with the MCP) or explicit `OPENCODE_URL`; remote instances registered dynamically via `connect_server`; sessions remember their server and route automatically.
+- **Authoritative state, no guessing** — terminal states come from opencode's `Session.outcome` field, not message-shape heuristics.
+- **Failure classification** — every failure is classified `[availability] / [compatibility] / [other]`, with the raw error preserved for reporting; version mismatches surface once per (connection, session, version).
+- **Safe defaults** — remote `chat` defaults to manual permission approval; credentials use `file > env > plaintext` priority and no `Authorization` header is sent when none is configured.
+- **Composable primitives** — `wait_session` (pure state) and `get_messages` (incremental cursor) separate waiting from reading.
+- **Production-grade runtime** — concurrent request handling, MCP-standard cancellation, bounded waits.
+
+## Tools
+
+| Tool | What it does |
+| --- | --- |
+| `create_session` | Create a session (optional title / agent / model / location) |
+| `chat` | Send a prompt and wait for the terminal state; supports file attachments and `steer` / `queue` delivery; can auto-answer permission requests |
+| `wait_session` | Pure state wait: `succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout` |
+| `get_messages` | Read the transcript; incremental pulls via `after_message_id` |
+| `permission_reply` | Answer a permission request: `once` / `always` / `reject` |
+| `form_reply` | Submit a form answer keyed by field |
+| `list_agents` | List agents and their resolved default models (read-only) |
+| `interrupt` | Stop the current generation |
+| `pending_interactions` | Non-blocking check for pending permissions / forms |
+| `list_sessions` | Enumerate / search sessions — the resume handle for earlier conversations |
+| `compact` | Compact context and wait for completion |
+| `get_context` | Token / cost usage and session metadata |
+| `delete_session` | Delete a session (irreversible; cascades to child sessions) |
+| `connect_server` | Register and validate a remote opencode connection |
+| `list_servers` | List connections with version and baseline status |
+| `disconnect_server` | Remove a dynamically registered remote connection |
+
+All tools accept an optional `server` parameter; calls carrying a `session_id` are routed automatically to the connection that owns that session.
 
 ## Connection model: MCP-spawned local + multi-server
 
@@ -17,7 +80,7 @@ MCP is a stdio JSON-RPC 2.0 server (newline-delimited, not LSP Content-Length fr
 1. **Explicit direct connect**: when `OPENCODE_URL` is set, `local` points at that address (password from `OPENCODE_PASSWORD`, default `opencode`).
 2. **MCP-spawned serve** (default): the first time `local` is needed, the MCP spawns its own `opencode serve` — **random high port + random password** injected via `OPENCODE_SERVER_PASSWORD`. It runs as a child process and dies with the MCP instance; multiple MCP instances never collide thanks to the random ports. If `opencode` is not on `PATH`, the call fails with an availability error (user environment issue, no retries).
 
-**Multi-server**: `connect_server(name, url, password_file?/password_env?/password?)` registers a remote connection (process-lifetime only, never persisted). Every tool accepts an optional `server` parameter (defaults to `local`); calls carrying a `session_id` are routed automatically to the connection that owns that session. Credential priority: **file > env > plaintext**; when no credential source is given, no `Authorization` header is sent (some remotes accept no auth).
+**Multi-server**: `connect_server(name, url, password_file?/password_env?/password?)` registers a remote connection (process-lifetime only, never persisted). Credential priority: **file > env > plaintext**; when no credential source is given, no `Authorization` header is sent (some remotes accept no auth).
 
 **Version baseline and failure classification**: every connection is hard-gated at creation (unreachable = `[availability]`; reachable but not an opencode API = `[compatibility]`). After a request failure the version is re-queried and the failure is classified as `[availability] / [compatibility] / [other]` — `other` carries the full original error for reporting. When a server version differs from the development baseline, a single `api_version_warning` is injected into the first tool result touching each (connection, session, version) pair — new sessions see it, the same session is never spammed.
 
@@ -32,102 +95,14 @@ MCP is a stdio JSON-RPC 2.0 server (newline-delimited, not LSP Content-Length fr
 
 ## Concurrency and cancellation
 
-- **Concurrency**: each JSON-RPC request is handled in its own worker thread (`OPENCODE_MCP_WORKERS`, default 4). Long-blocking calls such as `chat` / `wait_session` never block other tool calls.
-- **Cancellation**: MCP-standard `notifications/cancelled` is honored. Cancelling `chat` / `wait_session` stops polling within 1 second (the request no longer writes a response; a single in-flight HTTP request can take up to its 30-second timeout to unwind).
-
-## Version baseline and warnings
-
-Covered by the connection-model section above: per-connection hard gate at creation, version re-query and failure classification after errors, and warnings de-duplicated per (connection, session, version). Baseline defaults to `2.0.12`, overridable with `OPENCODE_MCP_BASELINE_VERSION`.
+- Each JSON-RPC request is handled in its own worker thread (`OPENCODE_MCP_WORKERS`, default 4). Long-blocking calls such as `chat` / `wait_session` never block other tool calls.
+- MCP-standard `notifications/cancelled` is honored: cancelling `chat` / `wait_session` stops polling within 1 second (a single in-flight HTTP request can take up to its 30-second timeout to unwind).
 
 ## Model selection
 
 - This MCP **never pins models on the caller's behalf**: `create_session` without `model_id` leaves `model=null`, and the run falls back to the **location default model** (`GET /api/model/default`).
-- Measured behavior (opencode v2.0.12): the location default does **not** follow agent configuration — the TUI and opencode's internal spawning pin models explicitly at session creation, while bare-API sessions fall back to the location default. Pass `model_id` (`providerID/modelID`) explicitly when you need a specific model.
-- **Reading the agent → model mapping**: use the `list_agents` tool (backed by `GET /api/agent`, plugin-resolved). To align a session with an agent's model, read the mapping and pass `model_id` yourself.
-
-## Registering with opencode
-
-```bash
-opencode mcp add opencode-local -- python3 /root/opencode-mcp/server.py
-```
-
-## Tools (16)
-
-All tools accept an optional `server` parameter. Tool results are JSON text with a stable `status` vocabulary: `succeeded / failed / interrupted / needs_permission / needs_form / timeout / cancelled / compaction_failed`.
-
-### 1. `create_session`
-
-Create a session. Optional `title`, `agent`, `model_id` (`providerID/modelID`), `location` (`{"directory": "..."}`). Returns `session_id`, the owning `server`, plus title/agent/model as reported by the API.
-
-### 2. `chat`
-
-Send a prompt and wait for the turn to reach a terminal state.
-
-Parameters: `session_id` (required), `text` (required), `timeout_secs?` (default 120, clamped 1–3600), `auto_permission?` (defaults: local `once`, remote `manual`), `delivery?` (`steer` redirects a running generation, `queue` waits for the current turn to finish), `files?` (array of `{uri(required), name?, description?}`).
-
-Statuses: `succeeded` (with `assistant_text`, `tools_used`, optional `reasoning`, `last_message_id`), `failed`, `interrupted`, `needs_permission` (with `requests`), `needs_form`, `timeout` (with `partial_text` and `diagnostics`).
-
-### 3. `wait_session`
-
-**Pure state primitive**: waits until the session reaches a terminal or blocked state. Never returns message content and never answers permissions itself.
-
-Returns `succeeded / failed / interrupted` (from the authoritative `outcome`), `needs_permission` (`requests`), `needs_form` (`forms` with field key/title/type/required/options/description), or `timeout` (`diagnostics`). Always includes `last_message_id` as the incremental cursor.
-
-Typical composition: after answering a permission or form, `wait_session` until terminal, then pull new content with `get_messages(after_message_id=...)`.
-
-### 4. `get_messages`
-
-Messages in ascending time order, formatted (role, text, tool summaries, timestamps). Supports incremental pulls: pass `after_message_id` (the previous `last_message_id`) to get only newer messages; the response returns a fresh `last_message_id`.
-
-Note: the underlying API windows on the **tail** of the conversation (the newest N messages), which keeps long sessions correct.
-
-### 5. `permission_reply`
-
-Answer a permission request: `decision` = `once` (allow this time), `always` (allow and save the rule), `reject`. Optional `message`.
-
-### 6. `form_reply`
-
-Submit a form answer: `answer` is an object keyed by field `key`; values may be string / number / boolean / string[].
-
-### 7. `list_agents`
-
-Read-only listing of all agents and their resolved default models (`model: null` means no explicit model; the run falls back to the location default). This tool provides information only — it never pins models for you.
-
-### 8. `interrupt`
-
-Interrupt the session's current generation. Useful after `chat` returns `timeout`.
-
-### 9. `pending_interactions`
-
-Non-blocking check for pending permission requests and forms: `{server, session_id, permissions, forms}`.
-
-### 10. `list_sessions`
-
-Enumerate / search existing sessions: `search?`, `limit?` (default 20), `order?` (`asc|desc`, default `desc`), `directory?`, `cursor?`. Returns `{count, sessions: [{id, title, agent, model, parentID, time}], cursor}` — combine with `chat` to resume earlier conversations.
-
-### 11. `compact`
-
-Compact the session context and wait for completion. Statuses: `succeeded`, `compaction_failed`, `timeout`. Useful when context approaches the limit; you can continue chatting afterwards.
-
-### 12. `get_context`
-
-Context usage and metadata: `{server, id, title, agent, model, parentID, tokens, cost, time, revert}` (`tokens` / `cost` may be null). Pair with `compact` to decide whether to shrink.
-
-### 13. `delete_session`
-
-Delete a session. ⚠️ **Irreversible**, and **cascades to child sessions** (children return 404 once the parent is deleted).
-
-### 14. `connect_server`
-
-Register and validate a remote opencode connection (process-lifetime only, never persisted). Validation at creation: unreachable = availability error; no version = compatibility error; version mismatch returns a warning. Credentials: `password_file` (first line) > `password_env` > plaintext `password`; with none given, no `Authorization` header is sent. Returns `{name, url, version, baseline, baseline_check}`.
-
-### 15. `list_servers`
-
-List all current connections (local + dynamic remotes): name, URL, source, version, and baseline-check status. Ensures the local connection is ready (spawning it if needed).
-
-### 16. `disconnect_server`
-
-Remove a dynamically registered remote connection (`local` cannot be removed). Session routes belonging to it are cleared.
+- Measured (opencode v2.0.12): the location default does **not** follow agent configuration — the TUI and opencode's internal spawning pin models explicitly at session creation, while bare-API sessions fall back to the location default. Pass `model_id` (`providerID/modelID`) explicitly when you need a specific model.
+- **Reading the agent → model mapping**: use `list_agents` (backed by `GET /api/agent`, plugin-resolved). To align a session with an agent's model, read the mapping and pass `model_id` yourself.
 
 ## Permission and form flows
 
@@ -170,16 +145,19 @@ curl -u "opencode:$PASSWORD" -X POST "$URL/api/session" -H 'Content-Type: applic
 
 Then `chat(..., auto_permission="manual")` deterministically exercises `needs_permission`; answer with `permission_reply` and continue with `wait_session`.
 
-## Verified flows (opencode v2.0.12)
+## Verified flows
+
+All verified live against opencode v2.0.12:
 
 1. **Create + chat**: `create_session` → `chat` → `succeeded` with `assistant_text` / `tools_used`.
 2. **Manual permission loop**: `chat(auto_permission="manual")` → `needs_permission` → `permission_reply(decision="once")` → `wait_session` → terminal.
 3. **Form pipeline**: `chat` / `wait_session` returns `needs_form` (with field details) → `form_reply` → `wait_session` → terminal.
 4. **Automatic permission**: default `auto_permission="once"` approves and continues; a single `chat` returns `succeeded`.
 5. **Connection layer**: explicit-env and MCP-spawned local paths; spawned serve carries a real conversation and dies with its parent; failure classification (dead port = availability, HTML-only service = compatibility, 401 = credentials); duplicate-name and unknown-server errors; session auto-routing; disconnect rules.
-6. **Real remote end-to-end**: `connect_server` with plaintext credentials → remote `create_session` → remote `chat` → remote manual-permission default (blocked, not auto-approved) → `permission_reply` → `wait_session` → incremental `get_messages` → `disconnect_server`.
+6. **Real remote end-to-end**: `connect_server` over the network → remote `create_session` → remote `chat` → remote manual-permission default (blocked, not auto-approved) → `permission_reply` → `wait_session` → incremental `get_messages` → `disconnect_server`.
 7. **Long-session window**: on a 200+ message session, tail-window fetching keeps gate lookup, incremental cursors and `last_message_id` correct.
 8. **Cancellation & concurrency**: `notifications/cancelled` stops polling within 1s; concurrent `pending_interactions` returns in milliseconds while `chat` is in flight.
+9. **Host integrations**: mounted as a tool provider in the Hermes agent gateway; hosted by the oh-my-opencode-slim orchestration framework to drive nested opencode sessions.
 
 ## Testing
 

@@ -2,18 +2,75 @@
 
 [English](README.md) | **中文**
 
-一个用**纯 Python 3 标准库**实现的 MCP(Model Context Protocol)stdio server,用于操作**本机 opencode** 的对话能力(创建会话、发送消息、轮询回复、处理权限与表单、中断生成)。
+**为什么需要它**：在 agent 普遍以 ACP(Agent Client Protocol)客户端身份直连 opencode 之前,通过 **HTTP API** 以 MCP 驱动 opencode 是 agent 操作它的最佳方案——本 server 就是为此而建:每个工具对应一套干净、机器可消费的状态机(权威终态、阻塞交互态、增量游标),而不是界面的复刻,天然适合 agent 编排。
 
-## 简介
+实测环境:
 
-- 协议:MCP over stdio,每行一个 JSON-RPC 2.0 消息(**换行分隔**,不是 LSP 的 `Content-Length` 帧)。
-- 提供的工具:`create_session` / `chat` / `wait_session` / `get_messages` / `list_agents` / `list_sessions` / `compact` / `get_context` / `delete_session` / `permission_reply` / `form_reply` / `interrupt` / `pending_interactions` / `connect_server` / `list_servers` / `disconnect_server`(共 16 个;全部支持可选 `server` 参数)。
-- 通过 opencode 的本地 HTTP API 通信:从 `service.json` 读取地址与密码,使用 HTTP Basic 鉴权(用户名固定 `opencode`)。
-- **懒连接**:`initialize` 阶段不做任何网络请求,第一次真正调用工具时才探活。
+- **opencode v2.0.12** —— 开发基准,全部能力均对其 live 验证
+- **真实远端实例** —— 完整网络端到端(连接 → 建会话 → 对话 → manual 权限 → 答复 → 等待 → 增量拉取 → 断连)
+- **Hermes agent gateway** —— 作为工具提供方挂载并在生产使用
+- **oh-my-opencode-slim 编排框架** —— 托管本 MCP 并借此驱动嵌套 opencode 会话
 
-## 零依赖说明
+## 范围
 
-只依赖 Python 3 标准库(`json` / `urllib` / `base64` / `subprocess` 等),**不需要也不允许 `pip install` 任何第三方包**。要求 Python 3.13,源码统一 UTF-8,输出 JSON 使用 `ensure_ascii=False`。
+这**不是**面面俱到的 opencode 控制面,也不打算是。范围刻意收敛到 agent 日常操作 opencode 真正需要的能力:
+
+- 创建/恢复会话、发送 prompt、收集结果
+- 处理两种阻塞交互 —— 权限请求与表单
+- 上下文管理(用量查看、压缩)与会话生命周期
+- 多 opencode 服务端(本地与远端)的路由
+
+文件系统、凭据、provider、插件、终端、配置等管理面**刻意不做**。工具更少、语义更锋利、出错面更小。
+
+## 用 LLM 安装
+
+把下面这段交给你的编码 agent:
+
+```text
+帮我安装并注册 opencode-mcp:
+
+1. 克隆: git clone https://github.com/yitro-z-wang/opencode-mcp ~/opencode-mcp
+2. 验证: 运行 `python3 ~/opencode-mcp/test_client.py` —— 必须报告 16 个工具且通过。
+3. 注册到 opencode: `opencode mcp add opencode-local -- python3 ~/opencode-mcp/server.py`
+4. 重载 opencode 配置,然后新开一个会话确认 16 个 opencode-local 工具可用。
+
+要求: Python 3.10+ 且 opencode CLI 在 PATH 上(v2.0.12 为开发基准)。
+出错请原样回报,不要盲目重试。
+```
+
+## 特性
+
+- **零依赖** —— 纯 Python 3 标准库,单文件,无构建步骤
+- **多服务器** —— MCP 专属拉起本地 serve(随机端口+随机密码,随 MCP 退出)或 `OPENCODE_URL` 显式直连;远端经 `connect_server` 动态注册;会话记住归属连接并自动路由
+- **权威状态,不做猜测** —— 终态取自 opencode 的 `Session.outcome` 字段,而非消息形状推断
+- **失败分类** —— 每次失败归类为 `[availability] / [compatibility] / [other]`,other 保留原始报错便于回报;版本不一致按 (连接, 会话, 版本) 只告警一次
+- **安全默认** —— 远端 `chat` 默认手动审批;凭据 `文件 > env > 明文`,无凭据时不发送 Authorization 头
+- **可组合原语** —— `wait_session`(纯状态)与 `get_messages`(增量游标)把“等待”和“读取”分离
+- **生产级运行时** —— 并发请求处理、MCP 标准取消、有界等待
+
+## 工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `create_session` | 创建会话(可选 title / agent / model / location) |
+| `chat` | 发送 prompt 并等待终态;支持附件与 `steer` / `queue` 投递;可自动答复权限请求 |
+| `wait_session` | 纯状态等待:`succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout` |
+| `get_messages` | 读取消息记录;经 `after_message_id` 增量拉取 |
+| `permission_reply` | 答复权限请求:`once` / `always` / `reject` |
+| `form_reply` | 按字段提交表单答案 |
+| `list_agents` | 列出 agent 及其解析后的默认模型(只读) |
+| `interrupt` | 中断当前生成 |
+| `pending_interactions` | 非阻塞查询待处理权限/表单 |
+| `list_sessions` | 枚举/搜索会话 —— 恢复历史话题的句柄 |
+| `compact` | 压缩上下文并等待完成 |
+| `get_context` | token/成本用量与会话元信息 |
+| `delete_session` | 删除会话(不可逆,级联删除子会话) |
+| `connect_server` | 注册并验证远端 opencode 连接 |
+| `list_servers` | 列出全部连接及版本/基准状态 |
+| `disconnect_server` | 移除动态注册的远端连接 |
+
+全部工具支持可选 `server` 参数;带 `session_id` 的调用自动路由到该会话所属连接。
+
 
 ## 连接模型:本地拉起 + 多服务器
 
