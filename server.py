@@ -9,11 +9,13 @@ Transport: MCP over stdio, one JSON-RPC 2.0 message per line (newline-delimited,
 Logs go to stderr; protocol messages go to stdout.
 """
 
+import atexit
 import base64
 import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -78,6 +80,74 @@ _SESSION_ROUTE = {}  # session_id -> connection name (insertion order; oldest ev
 _LOCAL_LOCK = threading.Lock()
 # Serial registration lock: eliminates the check-then-write race for concurrent connects with the same name (registration is infrequent)
 _REGISTER_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Spawned-child lifecycle
+#
+# The spawned `opencode serve` is a child process of this MCP, so this MCP owns its
+# lifetime: every code path that ends the process must end the child too, otherwise the
+# child is re-parented to init and serves a random port forever — one leaked serve per
+# MCP restart. Coverage:
+#   - stdin EOF (the normal MCP shutdown) and any other normal exit  -> atexit
+#   - SIGTERM / SIGHUP / SIGINT (host-managed kill)                  -> signal handlers
+#   - SIGKILL (uncatchable on any platform)                          -> a stale serve may survive;
+#     the next MCP start does not adopt it (no inferential discovery, by design).
+# ---------------------------------------------------------------------------
+
+_SPAWNED_PROCS = []  # every opencode serve this process started (guarded by _CLEANUP_LOCK)
+_CLEANUP_LOCK = threading.Lock()
+_CLEANUP_DONE = False
+
+
+def _kill_proc(proc):
+    """Terminate a child and reap it (no zombie). Never raises."""
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)  # Reap the child process to avoid a zombie
+    except Exception:
+        pass
+
+
+def _track_spawned_proc(proc):
+    with _CLEANUP_LOCK:
+        _SPAWNED_PROCS.append(proc)
+
+
+def _cleanup_spawned_procs():
+    """Kill every serve this process spawned; idempotent and safe from any exit path."""
+    global _CLEANUP_DONE
+    with _CLEANUP_LOCK:
+        if _CLEANUP_DONE:
+            return
+        _CLEANUP_DONE = True
+        procs = list(_SPAWNED_PROCS)
+        _SPAWNED_PROCS.clear()
+    for proc in procs:
+        _kill_proc(proc)
+
+
+def _install_signal_handlers():
+    """Kill spawned children before dying from a catchable signal, then exit with the signal's default semantics."""
+    def _handler(signum, _frame):
+        _cleanup_spawned_procs()
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            os._exit(128 + signum)
+
+    candidates = [signal.SIGTERM, signal.SIGINT]
+    if hasattr(signal, "SIGHUP"):
+        candidates.append(signal.SIGHUP)
+    for sig in candidates:
+        try:
+            signal.signal(sig, _handler)
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_spawned_procs)
 
 
 class Connection:
@@ -223,6 +293,7 @@ def _spawn_local_serve():
             source="spawned",
         )
         conn.spawned_proc = proc
+        _track_spawned_proc(proc)  # Owned by this process: killed on exit (atexit / signals)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             if proc.poll() is not None:
@@ -235,11 +306,7 @@ def _spawn_local_serve():
             except Exception:
                 pass
             time.sleep(0.3)
-        proc.kill()
-        try:
-            proc.wait(timeout=5)  # Reap the child process to avoid a zombie
-        except Exception:
-            pass
+        _kill_proc(proc)  # Failed attempt: kill and reap before trying another port
     raise OpenCodeError(
         "[availability] Failed to spawn the local opencode serve (none of 3 random ports became ready): %s"
         % last_err,
@@ -1893,6 +1960,7 @@ def _handle_request(message):
 
 
 def main():
+    _install_signal_handlers()  # Own the spawned serve's lifetime on host-kill paths too
     workers = max(1, int(os.environ.get("OPENCODE_MCP_WORKERS") or "4"))
     log(
         "[opencode-mcp] started, workers=%d, waiting for JSON-RPC on stdin" % workers

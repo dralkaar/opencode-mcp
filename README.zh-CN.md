@@ -77,7 +77,7 @@
 **禁止推断性自发现(含 service.json)。** 本地连接两种形态:
 
 1. **显式直连**:`OPENCODE_URL` 设置时,local 直接指向该地址(密码取 `OPENCODE_PASSWORD`,缺省 `opencode`)。
-2. **专属拉起**(默认):首次需要 local 时,MCP 自己拉起一个 `opencode serve`——**随机高位端口 + 随机密码**(经 `OPENCODE_SERVER_PASSWORD` 注入),子进程模式随本 MCP 实例生命周期退出;多个 MCP 实例靠随机端口互不冲突。`PATH` 中无 `opencode` 时返回可用性错误(用户环境问题,不重试)。
+2. **专属拉起**(默认):首次需要 local 时,MCP 自己拉起一个 `opencode serve`——**随机高位端口 + 随机密码**(经 `OPENCODE_SERVER_PASSWORD` 注入),子进程模式随本 MCP 实例退出:**每个 MCP 进程最多拉起一个**(进程内单例),并在 stdin EOF(host 正常关闭)与 `SIGTERM` / `SIGINT` / `SIGHUP` 时被杀掉并回收。多个 MCP 实例靠随机端口互不冲突,也不会累积——每次重启都会清理自己的子进程。唯一缺口是 `SIGKILL`:任何平台的进程都无法拦截它,被硬杀时可能残留一个 serve(后续不会认领它——按设计不做推断性发现)。`PATH` 中无 `opencode` 时返回可用性错误(用户环境问题,不重试)。
 
 **多服务器**:`connect_server(name, url, password_file?/password_env?/password?)` 注册远端(仅进程内有效,不持久化);全部工具带可选 `server` 参数(缺省 local);带 `session_id` 的调用自动路由到创建该会话的连接。凭据优先级:**文件 > env > 明文**;全部缺省时不发送 Authorization 头(存在空用户名/密码的远端)。
 
