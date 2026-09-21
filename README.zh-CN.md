@@ -53,14 +53,14 @@
 | 工具 | 作用 |
 | --- | --- |
 | `create_session` | 创建会话(可选 title / agent / model / location) |
-| `chat` | 发送 prompt 并等待终态;支持附件与 `steer` / `queue` 投递;可自动答复权限请求 |
-| `wait_session` | 纯状态等待:`succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout` |
+| `chat` | 发送 prompt 并等待终态;支持附件与 `steer` / `queue` 投递;可自动答复权限请求;此处 `wait_for_subagents` 默认 `false`(本轮停止流式输出即返回,并报告仍在运行的内容) |
+| `wait_session` | 纯状态等待:`succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout`;`wait_for_subagents` 默认 `true`(被委派的子 agent 仍在运行时不会报告 `succeeded`) |
 | `get_messages` | 读取消息记录;经 `after_message_id` 增量拉取 |
 | `permission_reply` | 答复权限请求:`once` / `always` / `reject` |
 | `form_reply` | 按字段提交表单答案 |
 | `list_agents` | 列出 agent 及其解析后的默认模型(只读) |
 | `interrupt` | 中断当前生成 |
-| `pending_interactions` | 非阻塞查询待处理权限/表单 |
+| `pending_interactions` | 非阻塞查询待处理权限/表单(聚合该会话的子 agent 子树) |
 | `list_sessions` | 枚举/搜索会话 —— 恢复历史话题的句柄 |
 | `compact` | 压缩上下文并等待完成 |
 | `get_context` | token/成本用量与会话元信息 |
@@ -383,6 +383,17 @@ opencode mcp add opencode-local -- python3 /root/opencode-mcp/server.py
 
 > 提示:若某个权限请求已经被其他途径处理,`permission_reply` 可能返回错误;此时直接调用 `wait_session` 或 `pending_interactions` 重新确认状态即可。
 
+## 子会话感知等待(多 agent 会话)
+
+主 agent 委派子 agent 之后,**自己的这一轮会先结束,而子 agent 还在跑**。opencode 的 `outcome` 是**按轮**的 —— 它的含义是"这个会话此刻没有生成在跑",而不是"任务完成" —— 所以朴素地等待会提前宣布成功,甚至让子 agent 卡在一个永远无人看到的审批上。
+
+因此本 server 会依据权威的 `parentID` 关系解析出会话的**子 agent 子树**(`GET /api/session?parentID=…`,深度 ≤ 3、节点 ≤ 64,完全不解析对话内容),并且在子树里还有任何活着的节点时拒绝报告 `succeeded`:
+
+- `wait_session` 的 `wait_for_subagents` 默认 `true` —— 只有整棵子树静止(无节点在生成、且子树内无待处理权限/表单)才返回 `succeeded`。
+- `chat` 的 `wait_for_subagents` 默认 `false` —— 本轮停止流式输出即返回,但 payload 始终带 `subagents` / `pending_subagents` / `subtree_truncated` / `subtree_verified`,调用方据此可看到仍有工作在跑,再用 `wait_session` 继续跟进。
+- **子 agent 的阻塞交互同样会被上报**:子会话卡在审批时返回 `needs_permission`,其 `session_id` 是**真正持有该请求的子会话**(并附 `root_session_id`),答复会自动路由到持有该会话的那台服务器。`auto_permission` 取 `once` / `always` / `reject` 时,答复作用于整棵子树;表单永不自动答复。
+- **fail-closed**:若活动表或待处理交互状态无法校验,绝不返回 `succeeded` —— 等待会持续到超时,并明确告知哪些无法校验(`subtree_verified: false`)。缺失这些端点的老服务端按连接探测一次后回退到旧行为,并如实标注,绝不谎称已验证。
+
 ## 权限规则与 action 命名
 
 权限请求 `Permission.Request` 的关键字段:
@@ -437,7 +448,12 @@ curl -u opencode:$OPENCODE_PASSWORD \
 3. **表单管道**:`chat` / `wait_session` 返回 `needs_form`(含字段详情)→ `form_reply(form_id, answer)` → `wait_session` 直至终态。
 4. **默认自动授权**:`chat` 使用默认 `auto_permission="once"`,遇到权限请求自动放行并继续,一次调用即返回 `succeeded`。
 
-> **本轮为 A 批次**:新增 `list_sessions` / `compact` / `get_context` / `delete_session` 四个工具,并为 `chat` 增加 `delivery` / `files` 参数、为 `create_session` 增加 `location` 参数。以上第 1–4 项为既有 live 验证;A 批次新增能力的 live 网络验证待后续批次执行(本轮只做编译与冒烟测试)。
+5. **连接层**:显式 env 与 MCP 专属拉起两条本地路径;专属 serve 能承载真实对话并随 MCP 退出而退出;失败分类(死端口 = availability、仅返回 HTML 的服务 = compatibility、401 = 凭据问题);重名与未知服务器报错;会话自动路由;断连规则。
+6. **真实远端端到端**:`connect_server` 跨网络连接 → 远端 `create_session` → 远端 `chat` → 远端默认手动审批(被阻塞而非自动放行)→ `permission_reply` → `wait_session` → 增量 `get_messages` → `disconnect_server`。
+7. **长会话窗口**:在 200+ 条消息的会话上,尾部窗口拉取保证 gate 查找、增量游标与 `last_message_id` 正确。
+8. **取消与并发**:`notifications/cancelled` 在 1 秒内停止轮询;`chat` 在途时并发调用 `pending_interactions` 毫秒级返回。
+9. **宿主集成**:作为工具提供方挂载进 Hermes agent gateway;由 oh-my-opencode-slim 编排框架托管并驱动嵌套 opencode 会话。
+10. **子会话感知等待**:主 agent 后台委派一个卡在 `shell` 审批上的子 agent —— `wait_session`(默认)返回 `needs_permission` 且指向**子会话**的 `session_id`(并带 `root_session_id`),而不是提前的 `succeeded`;`chat`(默认)返回 `succeeded` 但报告 `pending_subagents: 1`。另已验证:三个并行子 agent 各自待审批、子 agent 卡在表单上、`auto_permission="once"` 答复子会话后到达 `succeeded`,以及同样的流程在**远端连接**上不带 `server` 也能正确路由。
 
 ## 测试
 

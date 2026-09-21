@@ -41,6 +41,29 @@ POLL_INTERVAL = 1.0
 
 VALID_AUTO_PERMISSION = ("once", "always", "reject", "manual")
 
+# --- Subtree (subagent) resolution -----------------------------------------
+# Structure only: the subtree is the reverse closure of parentID via ?parentID= (never any
+# message-content heuristic). Depth/node caps keep one runaway tree from costing unbounded work.
+SUBTREE_MAX_DEPTH = 3
+SUBTREE_MAX_NODES = 64
+SUBTREE_AUTOREPLY = ("once", "always", "reject")
+
+# Per-connection capability keys: marked unsupported (once, permanently for that connection) when
+# the endpoint genuinely does not exist (404 / reworked API), so we fall back instead of hanging.
+CAP_SESSION_ACTIVE = "session_active"
+CAP_GLOBAL_PERMISSION = "global_permission"
+CAP_GLOBAL_FORM = "global_form"
+CAP_SESSION_PARENTID = "session_parentid"
+
+SUBTREE_UNVERIFIED_NOTE = (
+    "Subagent state could not be verified (fail-closed); the reported status is this session's own "
+    "outcome only and may be stale with respect to child sessions."
+)
+SUBTREE_UNSUPPORTED_NOTE = (
+    "This opencode server does not support subagent verification (/api/session/active or ?parentID=); "
+    "the reported status is this session's own outcome only and may be stale with respect to child sessions."
+)
+
 
 def log(*parts):
     """Write logs to stderr to avoid polluting the stdout protocol stream."""
@@ -162,6 +185,7 @@ class Connection:
         self.server_version = None
         self.sessions_warned = {}  # session_id -> server_version at warning time
         self.spawned_proc = None
+        self.subtree_unsupported = set()  # subtree capability keys proven unavailable on this server
 
     def auth_header(self):
         if not self.password:
@@ -751,9 +775,399 @@ def fetch_forms(conn, session_id, pending_only=True):
 
 
 # ---------------------------------------------------------------------------
+# Subtree (subagent) awareness
+#
+# A parent's own outcome is per-turn and can be succeeded/idle while child sessions are still
+# working (background delegation), so `succeeded` is only accepted once the whole subtree is
+# quiescent. Structure is resolved purely by reverse parentID closure; activity and pending
+# interactions are re-read every poll. Everything is fail-closed: an unexpected shape, missing
+# key, 404 or request failure means UNKNOWN and success is never declared on UNKNOWN.
+# ---------------------------------------------------------------------------
+
+
+def _capability_unsupported(conn, cap):
+    return cap in conn.subtree_unsupported
+
+
+def _mark_capability_unsupported(conn, cap, exc):
+    """Record (once) that a server cannot support a subtree capability; returns True if newly marked."""
+    with _STATE_LOCK:
+        if cap in conn.subtree_unsupported:
+            return False
+        conn.subtree_unsupported.add(cap)
+    log(
+        "[opencode-mcp] subtree capability %s unsupported on %s, falling back to legacy: %s"
+        % (cap, conn.name, exc)
+    )
+    return True
+
+
+def _is_capability_error(exc):
+    """A compatibility classification (404 GET / reworked API) means the endpoint genuinely does not exist."""
+    return isinstance(exc, OpenCodeError) and exc.kind == "compatibility"
+
+
+def _active_session_ids(conn):
+    """Return (set_of_active_session_ids, verified).
+
+    Server-wide map of sessions with a live foreground drain. A blocked-on-permission session still
+    appears as running; an idle parent is absent. verified=False is fail-closed: a missing or odd
+    payload must never be read as "nothing is active".
+    """
+    if _capability_unsupported(conn, CAP_SESSION_ACTIVE):
+        return None, False
+    try:
+        payload = http_request(conn, "GET", "/api/session/active")
+    except OpenCodeError as exc:
+        if _is_capability_error(exc):
+            _mark_capability_unsupported(conn, CAP_SESSION_ACTIVE, exc)
+        return None, False
+    data = unwrap(payload)
+    if not isinstance(data, dict):
+        return None, False
+    active = set()
+    for sid, value in data.items():
+        if not isinstance(sid, str) or not isinstance(value, dict):
+            return None, False
+        active.add(sid)
+    return active, True
+
+
+def _subtree_ids(conn, root_id):
+    """Reverse closure of parentID (direct children via ?parentID= only), with caps and a cycle guard.
+
+    Returns {"root", "ids", "info", "truncated"} or None when the structure cannot be verified
+    (fail-closed). Structure only: no activity is cached, no message content is inspected.
+    """
+    if not root_id:
+        return None
+    if _capability_unsupported(conn, CAP_SESSION_PARENTID):
+        return None
+    ids = [root_id]
+    info = {root_id: None}
+    depth = {root_id: 0}
+    seen = {root_id}
+    frontier = [root_id]
+    truncated = False
+    cursor = 0
+    while cursor < len(frontier):
+        current = frontier[cursor]
+        cursor += 1
+        cur_depth = depth[current]
+        try:
+            payload = http_request(
+                conn, "GET", "/api/session", query={"parentID": current}
+            )
+        except OpenCodeError as exc:
+            if _is_capability_error(exc):
+                _mark_capability_unsupported(conn, CAP_SESSION_PARENTID, exc)
+            return None
+        data = unwrap(payload)
+        if not isinstance(data, list):
+            return None
+        for child in data:
+            if not isinstance(child, dict):
+                return None
+            child_id = child.get("id")
+            if not isinstance(child_id, str) or not child_id:
+                return None
+            if child_id in seen:
+                continue  # cycle / duplicate guard
+            if cur_depth + 1 > SUBTREE_MAX_DEPTH:
+                truncated = True  # a deeper node exists but is outside the depth cap
+                continue
+            if len(seen) >= SUBTREE_MAX_NODES:
+                truncated = True  # node cap hit
+                break
+            seen.add(child_id)
+            ids.append(child_id)
+            frontier.append(child_id)
+            depth[child_id] = cur_depth + 1
+            info[child_id] = child
+            _route_session(child_id, conn)  # route replies for this child to the right server
+        if truncated:
+            break
+    _route_session(root_id, conn)
+    return {"root": root_id, "ids": ids, "info": info, "truncated": truncated}
+
+
+def _subagent_entries(tree, active):
+    """Payload-ready subagent list (subtree nodes excluding the root). active=None means unknown."""
+    entries = []
+    root = tree.get("root")
+    for sid in tree.get("ids") or []:
+        if sid == root:
+            continue
+        node = (tree.get("info") or {}).get(sid) or {}
+        entries.append(
+            {
+                "session_id": sid,
+                "agent": node.get("agent"),
+                "model": node.get("model"),
+                "title": node.get("title"),
+                "outcome": node.get("outcome"),
+                "active": (sid in active) if active is not None else None,
+                "parentID": node.get("parentID"),
+            }
+        )
+    return entries
+
+
+def _fetch_global_pending(conn, path, cap):
+    """Global (location-wide) pending list. Returns (items, status), status in ok/unsupported/unknown.
+
+    The global list may contain requests from other callers/MCPs on a shared or remote server;
+    callers must filter by exact subtree membership.
+    """
+    if _capability_unsupported(conn, cap):
+        return None, "unsupported"
+    try:
+        payload = http_request(conn, "GET", path)
+    except OpenCodeError as exc:
+        if _is_capability_error(exc):
+            _mark_capability_unsupported(conn, cap, exc)
+            return None, "unsupported"
+        return None, "unknown"
+    data = unwrap(payload)
+    if not isinstance(data, list):
+        return None, "unknown"
+    for item in data:
+        if not isinstance(item, dict):
+            return None, "unknown"
+    return data, "ok"
+
+
+def _pending_interactions_tree(conn, session_ids):
+    """Aggregate pending permissions/forms over a subtree, filtered by exact session-id membership.
+
+    Global endpoints are preferred for the sweep, with per-session endpoints as the fallback.
+    Returns {"permissions", "forms", "verified"}; verified=False is fail-closed.
+    """
+    idset = set(session_ids)
+    verified = True
+
+    perms, pstat = _fetch_global_pending(
+        conn, "/api/permission/request", CAP_GLOBAL_PERMISSION
+    )
+    if pstat == "ok":
+        perms = [p for p in perms if p.get("sessionID") in idset]
+    else:
+        perms = []
+        if pstat == "unknown":
+            verified = False
+        else:
+            for sid in session_ids:
+                try:
+                    node_perms = fetch_permissions(conn, sid)
+                except OpenCodeError:
+                    verified = False
+                    break
+                if not isinstance(node_perms, list):
+                    verified = False
+                    break
+                for p in node_perms:
+                    if not isinstance(p, dict):
+                        verified = False
+                        break
+                    if not p.get("sessionID"):
+                        p = dict(p, sessionID=sid)
+                    if p.get("sessionID") in idset:
+                        perms.append(p)
+                if not verified:
+                    break
+
+    forms, fstat = _fetch_global_pending(conn, "/api/form", CAP_GLOBAL_FORM)
+    if fstat == "ok":
+        forms = [f for f in forms if f.get("sessionID") in idset]
+    else:
+        forms = []
+        if fstat == "unknown":
+            verified = False
+        else:
+            for sid in session_ids:
+                try:
+                    node_forms = fetch_forms(conn, sid, pending_only=True)
+                except OpenCodeError:
+                    verified = False
+                    break
+                for f in node_forms:
+                    if not isinstance(f, dict):
+                        verified = False
+                        break
+                    if not f.get("sessionID"):
+                        f = dict(f, sessionID=sid)
+                    if f.get("sessionID") in idset:
+                        forms.append(f)
+                if not verified:
+                    break
+
+    if not verified:
+        return {"permissions": [], "forms": [], "verified": False}
+    return {"permissions": perms, "forms": forms, "verified": True}
+
+
+def _subtree_snapshot(conn, root_id):
+    """Fresh full subtree state for gating/reporting (structure is never cached).
+
+    verified=False -> UNKNOWN (fail-closed, the caller must not declare success).
+    legacy=True -> the server cannot support verification at all; the caller may use the legacy path.
+    """
+    base = {
+        "verified": False,
+        "legacy": False,
+        "truncated": False,
+        "ids": [root_id],
+        "subagents": [],
+        "pending_subagents": None,
+        "permissions": [],
+        "forms": [],
+    }
+    tree = _subtree_ids(conn, root_id)
+    if tree is None:
+        if _capability_unsupported(conn, CAP_SESSION_PARENTID):
+            base["legacy"] = True
+        return base
+    ids = tree["ids"]
+    base["ids"] = ids
+    base["truncated"] = tree["truncated"]
+
+    active, active_ok = _active_session_ids(conn)
+    if not active_ok:
+        base["subagents"] = _subagent_entries(tree, None)
+        if _capability_unsupported(conn, CAP_SESSION_ACTIVE):
+            base["legacy"] = True
+        return base
+    if tree["truncated"]:
+        # Never declare success on a truncated tree; still report what we saw for diagnostics.
+        base["subagents"] = _subagent_entries(tree, active)
+        base["pending_subagents"] = sum(1 for sid in ids if sid in active)
+        return base
+
+    inter = _pending_interactions_tree(conn, ids)
+    base["subagents"] = _subagent_entries(tree, active)
+    if not inter["verified"]:
+        return base
+    base["verified"] = True
+    base["permissions"] = inter["permissions"]
+    base["forms"] = inter["forms"]
+    base["pending_subagents"] = sum(1 for sid in ids if sid in active)
+    return base
+
+
+def _subtree_quiescent(snap):
+    """True only when verification succeeded and nothing in the subtree is live or waiting."""
+    return bool(
+        snap.get("verified")
+        and not snap.get("truncated")
+        and (snap.get("pending_subagents") or 0) == 0
+        and not snap.get("permissions")
+        and not snap.get("forms")
+    )
+
+
+def _attach_subtree(payload, snap):
+    """Attach subtree fields to a payload without touching existing fields."""
+    payload["subagents"] = snap.get("subagents") or []
+    payload["pending_subagents"] = snap.get("pending_subagents")
+    payload["subtree_truncated"] = bool(snap.get("truncated"))
+    payload["subtree_verified"] = bool(snap.get("verified"))
+    if not snap.get("verified"):
+        payload.setdefault(
+            "note",
+            SUBTREE_UNSUPPORTED_NOTE if snap.get("legacy") else SUBTREE_UNVERIFIED_NOTE,
+        )
+    return payload
+
+
+def _autoreply_subtree_permissions(conn, snap, decision):
+    """Answer every pending permission in the subtree by POSTing to each request's own session."""
+    for req in snap.get("permissions") or []:
+        rid = req.get("id")
+        owner = req.get("sessionID")
+        if not rid or not owner:
+            continue
+        try:
+            http_request(
+                conn,
+                "POST",
+                "/api/session/%s/permission/%s/reply"
+                % (urllib.parse.quote(owner, safe=""), urllib.parse.quote(rid, safe="")),
+                body={"decision": decision},
+            )
+        except OpenCodeError as exc:
+            log("[opencode-mcp] subtree permission auto-reply failed", owner, rid, exc)
+
+
+def _enrich_forms(conn, forms):
+    """The global /api/form list omits field detail; refetch per owning session so replies stay answerable.
+
+    Best-effort: on any failure the original list is returned unchanged.
+    """
+    if not forms:
+        return forms
+    if all(isinstance(f.get("fields"), list) and f.get("fields") for f in forms):
+        return forms
+    owners = sorted({f.get("sessionID") for f in forms if f.get("sessionID")})
+    if not owners:
+        return forms
+    out = []
+    for owner in owners:
+        try:
+            out.extend(fetch_forms(conn, owner, pending_only=True))
+        except OpenCodeError:
+            return forms
+    return out or forms
+
+
+def _subtree_needs_payload(conn, root_id, snap, kind):
+    """needs_permission/needs_form payload whose session_id is the request's actual owning session."""
+    if kind == "permission":
+        items = snap.get("permissions") or []
+        owners = [p.get("sessionID") for p in items if p.get("sessionID")]
+        return {
+            "status": "needs_permission",
+            "server": conn.name,
+            "session_id": owners[0] if owners else root_id,
+            "root_session_id": root_id,
+            "requests": [
+                {
+                    "id": p.get("id"),
+                    "sessionID": p.get("sessionID"),
+                    "action": p.get("action"),
+                    "resources": p.get("resources"),
+                    "save": p.get("save"),
+                }
+                for p in items
+            ],
+            "subagents": snap.get("subagents") or [],
+            "pending_subagents": snap.get("pending_subagents"),
+            "subtree_truncated": bool(snap.get("truncated")),
+            "subtree_verified": bool(snap.get("verified")),
+            "note": "Reply with permission_reply, then call wait_session to keep waiting "
+            "(the request may belong to a subagent session; use its sessionID).",
+        }
+    items = _enrich_forms(conn, snap.get("forms") or [])
+    owners = [f.get("sessionID") for f in items if f.get("sessionID")]
+    return {
+        "status": "needs_form",
+        "server": conn.name,
+        "session_id": owners[0] if owners else root_id,
+        "root_session_id": root_id,
+        "forms": [_form_summary(f) for f in items],
+        "subagents": snap.get("subagents") or [],
+        "pending_subagents": snap.get("pending_subagents"),
+        "subtree_truncated": bool(snap.get("truncated")),
+        "subtree_verified": bool(snap.get("verified")),
+        "note": "Reply with form_reply, then call wait_session to keep waiting "
+        "(the form may belong to a subagent session; use its sessionID).",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Unified wait core (shared by chat / wait_session / compact)
 # Terminal determination trusts only the authoritative field Session.outcome (succeeded/failed/interrupted) + the gate message
 # timestamp; no message-shape inference (five historical rounds of bugs all came from shape heuristics, now fully removed).
+# On top of that, `succeeded` is gated on full-subtree quiescence when wait_for_subagents is set.
 # ---------------------------------------------------------------------------
 
 
@@ -778,7 +1192,15 @@ def _build_result(messages):
     return result
 
 
-def _result_payload(conn, session_id, status, baseline=None, with_result=False, time_idle=None):
+def _result_payload(
+    conn,
+    session_id,
+    status,
+    baseline=None,
+    with_result=False,
+    time_idle=None,
+    subtree=None,
+):
     """Terminal response body; last_message_id always provides the incremental cursor, and with_result attaches this round's new replies."""
     try:
         messages = fetch_messages(conn, session_id)
@@ -802,6 +1224,8 @@ def _result_payload(conn, session_id, status, baseline=None, with_result=False, 
             payload.setdefault(
                 "note", "Session is already completed/idle; no new replies this round."
             )
+    if subtree is not None:
+        _attach_subtree(payload, subtree)
     return payload
 
 
@@ -814,19 +1238,26 @@ def _run_until_terminal(
     gate_is_compaction=False,
     baseline=None,
     with_result=False,
+    wait_for_subagents=False,
 ):
     """Poll the session until terminal / needs interaction / timeout / cancellation (the unified wait core).
 
     Returns (status, payload). status ∈ {succeeded, failed, interrupted,
     compaction_failed, needs_permission, needs_form, timeout, cancelled}
+
+    wait_for_subagents: when set, `succeeded` additionally requires the whole subtree to be
+    quiescent (no active node, no pending permission/form anywhere in the subtree). failed /
+    interrupted are always returned immediately. auto_permission in once/always/reject answers
+    pending permissions of every subtree node by POSTing to each request's owning session.
     """
     started = time.monotonic()
     gate_created = None
+    last_subtree_unknown = False
     while True:
         if _current_request_cancelled():
             return "cancelled", {"status": "cancelled", "note": "The caller cancelled this request"}
 
-        # a. Permission requests
+        # a. Permission requests (the root session is always covered)
         try:
             permissions = fetch_permissions(conn, session_id)
         except OpenCodeError:
@@ -855,9 +1286,11 @@ def _run_until_terminal(
                     "status": "needs_permission",
                     "server": conn.name,
                     "session_id": session_id,
+                    "root_session_id": session_id,
                     "requests": [
                         {
                             "id": p.get("id"),
+                            "sessionID": session_id,
                             "action": p.get("action"),
                             "resources": p.get("resources"),
                             "save": p.get("save"),
@@ -877,6 +1310,7 @@ def _run_until_terminal(
                 "status": "needs_form",
                 "server": conn.name,
                 "session_id": session_id,
+                "root_session_id": session_id,
                 "forms": [_form_summary(f) for f in forms],
                 "note": "Reply with form_reply, then call wait_session to keep waiting.",
             }
@@ -923,9 +1357,61 @@ def _run_until_terminal(
                 gate_created is not None and (time_idle or 0) > gate_created
             )
             if gate_ok:
-                return outcome, _result_payload(
-                    conn, session_id, outcome, baseline, with_result, time_idle
-                )
+                # failed / interrupted are decided outcomes: return immediately, never delayed.
+                # A terminal `succeeded` without subtree gating still reports subagent state.
+                if outcome != "succeeded" or not wait_for_subagents:
+                    payload = _result_payload(
+                        conn, session_id, outcome, baseline, with_result, time_idle
+                    )
+                    if outcome == "succeeded":
+                        snap = _subtree_snapshot(conn, session_id)
+                        _attach_subtree(payload, snap)
+                        last_subtree_unknown = (not snap["verified"]) and (
+                            not snap["legacy"]
+                        )
+                    return outcome, payload
+
+                # succeeded + wait_for_subagents: the parent outcome is per-turn, so accept it
+                # only when the entire subtree is quiescent. The structure and activity map are
+                # read fresh here (decision-point refresh), not from an earlier snapshot.
+                snap = _subtree_snapshot(conn, session_id)
+                if snap["legacy"]:
+                    # The server cannot support verification: fall back, but never claim it was verified.
+                    payload = _result_payload(
+                        conn, session_id, "succeeded", baseline, with_result, time_idle
+                    )
+                    _attach_subtree(payload, snap)
+                    return "succeeded", payload
+                if _subtree_quiescent(snap):
+                    payload = _result_payload(
+                        conn,
+                        session_id,
+                        "succeeded",
+                        baseline,
+                        with_result,
+                        time_idle,
+                        subtree=snap,
+                    )
+                    return "succeeded", payload
+
+                # Not quiescent (or UNKNOWN). UNKNOWN must never become success: keep polling
+                # until the timeout, then report a timeout diagnostic.
+                last_subtree_unknown = not snap["verified"]
+                if snap["verified"]:
+                    if snap["permissions"]:
+                        if auto_permission in SUBTREE_AUTOREPLY:
+                            _autoreply_subtree_permissions(
+                                conn, snap, auto_permission
+                            )
+                        else:
+                            return "needs_permission", _subtree_needs_payload(
+                                conn, session_id, snap, "permission"
+                            )
+                    if snap["forms"]:  # forms are never auto-answered
+                        return "needs_form", _subtree_needs_payload(
+                            conn, session_id, snap, "form"
+                        )
+                # fall through: active subagents, truncated tree or UNKNOWN -> keep polling
 
         # d. Timeout (the diagnostics block includes the last message and this round's partial text)
         if time.monotonic() - started >= timeout_secs:
@@ -939,7 +1425,25 @@ def _run_until_terminal(
                 for m in msgs
                 if baseline is None or m.get("id") not in (baseline or set())
             ]
-            return "timeout", {
+            snap = _subtree_snapshot(conn, session_id)
+            if last_subtree_unknown:
+                note = (
+                    "Wait timed out (%s seconds); the session is still generating. "
+                    "Subagent activity could not be verified (fail-closed): the terminal state was not accepted."
+                    % timeout_secs
+                )
+            elif snap.get("truncated"):
+                note = (
+                    "Wait timed out (%s seconds); the session is still generating. "
+                    "The subagent subtree was truncated by the depth/node caps, so quiescence could not be confirmed."
+                    % timeout_secs
+                )
+            else:
+                note = (
+                    "Wait timed out (%s seconds); the session is still generating."
+                    % timeout_secs
+                )
+            payload = {
                 "status": "timeout",
                 "server": conn.name,
                 "session_id": session_id,
@@ -961,6 +1465,22 @@ def _run_until_terminal(
                     ),
                     "pending_permissions": len(permissions),
                     "pending_forms": len(forms),
+                    "active_subagents": [
+                        {
+                            "session_id": s.get("session_id"),
+                            "agent": s.get("agent"),
+                            "title": s.get("title"),
+                            "outcome": s.get("outcome"),
+                            "active": s.get("active"),
+                        }
+                        for s in (snap.get("subagents") or [])
+                        if s.get("active")
+                    ],
+                    "pending_subtree_permissions": len(snap.get("permissions") or []),
+                    "pending_subtree_forms": len(snap.get("forms") or []),
+                    "pending_subagents": snap.get("pending_subagents"),
+                    "subtree_verified": bool(snap.get("verified")),
+                    "subtree_truncated": bool(snap.get("truncated")),
                     "suggested_actions": [
                         "get_messages to check current progress",
                         "pending_interactions to check pending interactions",
@@ -968,8 +1488,10 @@ def _run_until_terminal(
                         "interrupt to stop generation",
                     ],
                 },
-                "note": "Wait timed out (%s seconds); the session is still generating." % timeout_secs,
+                "note": note,
             }
+            _attach_subtree(payload, snap)
+            return "timeout", payload
 
         time.sleep(POLL_INTERVAL)
 
@@ -982,6 +1504,18 @@ def _arg_timeout(args, default=120):
     """Parse the optional timeout_secs parameter and clamp it to [1, 3600] seconds."""
     value = int(args.get("timeout_secs", default) or default)
     return max(1, min(value, 3600))
+
+
+def _arg_bool(args, name, default=False):
+    """Parse an optional boolean argument; an explicit value overrides the default."""
+    value = args.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def tool_create_session(args):
@@ -1093,6 +1627,7 @@ def tool_chat(args):
     )
 
     _route_session(session_id, conn)
+    wait_for_subagents = _arg_bool(args, "wait_for_subagents", default=False)
     status, payload = _run_until_terminal(
         conn,
         session_id,
@@ -1101,6 +1636,7 @@ def tool_chat(args):
         gate_message_id=gate_id,
         baseline=baseline,
         with_result=True,
+        wait_for_subagents=wait_for_subagents,
     )
     return payload
 
@@ -1113,8 +1649,14 @@ def tool_wait_session(args):
         raise OpenCodeError("Missing required parameter session_id")
     timeout_secs = _arg_timeout(args)
     _route_session(session_id, conn)
+    wait_for_subagents = _arg_bool(args, "wait_for_subagents", default=True)
     status, payload = _run_until_terminal(
-        conn, session_id, timeout_secs, auto_permission="manual", with_result=False
+        conn,
+        session_id,
+        timeout_secs,
+        auto_permission="manual",
+        with_result=False,
+        wait_for_subagents=wait_for_subagents,
     )
     if status == "succeeded" and "note" not in payload:
         payload["note"] = "Use get_messages(after_message_id=...) to fetch new replies."
@@ -1248,18 +1790,32 @@ def tool_list_agents(args):
 
 
 def tool_pending_interactions(args):
+    """Pending human interactions for the session and its whole subtree (consistent with wait_session)."""
     conn = _resolve_connection(args)
     session_id = args.get("session_id")
     if not session_id:
         raise OpenCodeError("Missing required parameter session_id")
-    permissions = fetch_permissions(conn, session_id)
-    forms = [_form_summary(f) for f in fetch_forms(conn, session_id, pending_only=True)]
-    return {
+    _route_session(session_id, conn)
+    snap = _subtree_snapshot(conn, session_id)
+    if snap["verified"]:
+        permissions = snap["permissions"]
+        forms = [_form_summary(f) for f in _enrich_forms(conn, snap["forms"])]
+    else:
+        # Structure could not be verified: fall back to the root session's own view (legacy shape).
+        permissions = fetch_permissions(conn, session_id)
+        forms = [
+            _form_summary(f)
+            for f in fetch_forms(conn, session_id, pending_only=True)
+        ]
+    result = {
         "server": conn.name,
         "session_id": session_id,
+        "root_session_id": session_id,
         "permissions": permissions,
         "forms": forms,
     }
+    _attach_subtree(result, snap)
+    return result
 
 
 def _session_time(raw):
@@ -1518,7 +2074,8 @@ TOOLS = [
             "Returns status: succeeded (success, with assistant_text/tools_used/reasoning), "
             "failed (failure), interrupted (interrupted), "
             "needs_permission (waiting for authorization, with a requests list), needs_form (waiting for form input), "
-            "timeout (timed out, with partial_text and diagnostics)."
+            "timeout (timed out, with partial_text and diagnostics). "
+            "Terminal payloads also report subagent state (subagents / pending_subagents / subtree_truncated / subtree_verified)."
         ),
         "inputSchema": {
             "type": "object",
@@ -1527,6 +2084,11 @@ TOOLS = [
                 "session_id": _SHARED_SESSION_ID_PARAM,
                 "text": {"type": "string", "description": "Prompt text to send"},
                 "timeout_secs": _SHARED_TIMEOUT_PARAM,
+                "wait_for_subagents": {
+                    "type": "boolean",
+                    "description": "When true, a succeeded status additionally requires the whole subagent subtree to be quiescent (no active child, no pending permission/form) and auto_permission answers pending permissions of every subtree node. Default false (report subagent state without gating).",
+                    "default": False,
+                },
                 "auto_permission": {
                     "type": "string",
                     "enum": ["once", "always", "reject", "manual"],
@@ -1564,7 +2126,8 @@ TOOLS = [
             "Terminal status: succeeded (this round ended successfully) / failed (failure) / interrupted (interrupted), "
             "taken from the authoritative session field outcome; blocking states: needs_permission / needs_form (call again after replying); "
             "timeout means it was still generating when the wait timed out. Returns last_message_id as the get_messages incremental cursor, "
-            "to be used with get_messages(after_message_id=...) to fetch new replies."
+            "to be used with get_messages(after_message_id=...) to fetch new replies. "
+            "By default a succeeded status is only returned once the whole subagent subtree is quiescent; the payload reports subagents / pending_subagents / subtree_truncated / subtree_verified."
         ),
         "inputSchema": {
             "type": "object",
@@ -1572,6 +2135,11 @@ TOOLS = [
                 "server": _SHARED_SERVER_PARAM,
                 "session_id": _SHARED_SESSION_ID_PARAM,
                 "timeout_secs": _SHARED_TIMEOUT_PARAM,
+                "wait_for_subagents": {
+                    "type": "boolean",
+                    "description": "When true (default), succeeded additionally requires the whole subagent subtree to be quiescent (no active child session, no pending permission/form anywhere in the subtree); when false, the legacy behaviour is used but subagent state is still reported.",
+                    "default": True,
+                },
             },
             "required": ["session_id"],
             "additionalProperties": False,

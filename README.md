@@ -55,14 +55,14 @@ Report any errors verbatim; do not retry blindly.
 | Tool | What it does |
 | --- | --- |
 | `create_session` | Create a session (optional title / agent / model / location) |
-| `chat` | Send a prompt and wait for the terminal state; supports file attachments and `steer` / `queue` delivery; can auto-answer permission requests |
-| `wait_session` | Pure state wait: `succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout` |
+| `chat` | Send a prompt and wait for the terminal state; supports file attachments and `steer` / `queue` delivery; can auto-answer permission requests; `wait_for_subagents` defaults to `false` here (returns when this round stops streaming, and reports what is still running) |
+| `wait_session` | Pure state wait: `succeeded` / `failed` / `interrupted` / `needs_permission` / `needs_form` / `timeout`; `wait_for_subagents` defaults to `true` (does not report `succeeded` while delegated subagents are still live) |
 | `get_messages` | Read the transcript; incremental pulls via `after_message_id` |
 | `permission_reply` | Answer a permission request: `once` / `always` / `reject` |
 | `form_reply` | Submit a form answer keyed by field |
 | `list_agents` | List agents and their resolved default models (read-only) |
 | `interrupt` | Stop the current generation |
-| `pending_interactions` | Non-blocking check for pending permissions / forms |
+| `pending_interactions` | Non-blocking check for pending permissions / forms (aggregated over the session's subagent subtree) |
 | `list_sessions` | Enumerate / search sessions — the resume handle for earlier conversations |
 | `compact` | Compact context and wait for completion |
 | `get_context` | Token / cost usage and session metadata |
@@ -132,6 +132,17 @@ All tools accept an optional `server` parameter; calls carrying a `session_id` a
 2. Answer with `form_reply(form_id, answer)`.
 3. Call `wait_session` to continue until terminal.
 
+## Subagent-aware waiting (multi-agent sessions)
+
+A session can delegate to subagent sessions and then end its own turn **while they keep working**. opencode's `outcome` is per-turn — it means "this session has no generation running right now", not "the task is done" — so a naive wait reports success while delegated work is still in flight and can even leave a subagent blocked on an approval nobody will ever see.
+
+This server therefore resolves the session's subagent **subtree** from the authoritative `parentID` links (`GET /api/session?parentID=…`, depth ≤ 3, ≤ 64 nodes, no transcript heuristics) and refuses to report `succeeded` while anything in it is still live:
+
+- `wait_session` defaults to `wait_for_subagents: true` — it returns `succeeded` only once the whole subtree is quiescent: no node generating (per `/api/session/active`) and no pending permission or form anywhere inside it.
+- `chat` defaults to `wait_for_subagents: false` — it returns when this round stops streaming, but the payload always carries `subagents`, `pending_subagents`, `subtree_truncated` and `subtree_verified`, so a caller can see that work is still running and follow up with `wait_session`.
+- **A subagent's blocking interaction surfaces too**: a child waiting for approval comes back as `needs_permission` whose `session_id` is the **subagent that owns the request** (plus `root_session_id`), and the reply is routed to the connection that owns that session. With `auto_permission` in `once` / `always` / `reject`, the answer is applied to the whole subtree; forms are never auto-answered.
+- **Fail-closed**: if the activity map or the pending-interaction state cannot be verified, `succeeded` is never returned — the wait keeps polling to its timeout and says what could not be verified (`subtree_verified: false`). A server missing these endpoints is detected once per connection and falls back to the previous behavior, which is reported rather than passed off as verified.
+
 ## Permission rules and action naming
 
 Permission actions match tool names (measured: `shell`, `bash`, `edit`, `write`, `read`, `glob`, `grep`, `webfetch`, `external_directory`, ...); `resource` is the command text or path pattern (e.g. `*`). Rule `effect` is one of `allow / deny / ask`.
@@ -158,6 +169,7 @@ All verified live against opencode v2.0.12:
 7. **Long-session window**: on a 200+ message session, tail-window fetching keeps gate lookup, incremental cursors and `last_message_id` correct.
 8. **Cancellation & concurrency**: `notifications/cancelled` stops polling within 1s; concurrent `pending_interactions` returns in milliseconds while `chat` is in flight.
 9. **Host integrations**: mounted as a tool provider in the Hermes agent gateway; hosted by the oh-my-opencode-slim orchestration framework to drive nested opencode sessions.
+10. **Subagent-aware waiting**: a session delegating a background subagent that blocks on a `shell` approval — `wait_session` (default) returns `needs_permission` naming the **subagent's** session (plus `root_session_id`) instead of a premature `succeeded`, while `chat` (default) returns `succeeded` but reports `pending_subagents: 1`. Also verified: three parallel subagents each awaiting approval, a subagent blocked on a form, `auto_permission="once"` answering a subagent's request and then reaching `succeeded`, and the same flow over a remote connection where the reply routes correctly without an explicit `server`.
 
 ## Testing
 
