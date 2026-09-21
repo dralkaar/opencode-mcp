@@ -892,6 +892,11 @@ def _run_until_terminal(
 # 工具实现
 # ---------------------------------------------------------------------------
 
+def _arg_timeout(args, default=120):
+    """解析可选的 timeout_secs 参数。"""
+    return int(args.get("timeout_secs", default) or default)
+
+
 def tool_create_session(args):
     conn = _resolve_connection(args)
     body = {}
@@ -954,7 +959,7 @@ def tool_chat(args):
     session_id = args.get("session_id")
     if not session_id:
         raise OpenCodeError("缺少必填参数 session_id")
-    timeout_secs = int(args.get("timeout_secs", 120) or 120)
+    timeout_secs = _arg_timeout(args)
     # 远端连接默认 manual(审批过程必在调用方),本地默认 once
     auto_permission = args.get("auto_permission") or conn.default_auto_permission()
     if auto_permission not in VALID_AUTO_PERMISSION:
@@ -1019,7 +1024,7 @@ def tool_wait_session(args):
     session_id = args.get("session_id")
     if not session_id:
         raise OpenCodeError("缺少必填参数 session_id")
-    timeout_secs = int(args.get("timeout_secs", 120) or 120)
+    timeout_secs = _arg_timeout(args)
     _route_session(session_id, conn)
     status, payload = _run_until_terminal(
         conn, session_id, timeout_secs, auto_permission="manual", with_result=False
@@ -1227,7 +1232,7 @@ def tool_compact(args):
     session_id = args.get("session_id")
     if not session_id:
         raise OpenCodeError("缺少必填参数 session_id")
-    timeout_secs = int(args.get("timeout_secs", 120) or 120)
+    timeout_secs = _arg_timeout(args)
     auto_permission = args.get("auto_permission") or conn.default_auto_permission()
 
     baseline = set(m.get("id") for m in fetch_messages(conn, session_id))
@@ -1365,6 +1370,19 @@ def tool_disconnect_server(args):
 # 工具清单(schema + 中文说明)
 # ---------------------------------------------------------------------------
 
+# 共享参数 schema(只读复用;序列化用途,不做变更)
+_SHARED_SERVER_PARAM = {
+    "type": "string",
+    "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接",
+}
+_SHARED_SESSION_ID_PARAM = {"type": "string", "description": "会话 ID(ses_...)"}
+_SHARED_TIMEOUT_PARAM = {
+    "type": "integer",
+    "description": "最长等待秒数,默认 120",
+    "default": 120,
+}
+
+
 TOOLS = [
     {
         "name": "create_session",
@@ -1376,7 +1394,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
+                "server": _SHARED_SERVER_PARAM,
                 "title": {"type": "string", "description": "会话标题(可选)"},
                 "agent": {"type": "string", "description": "使用的 agent 名称(可选)"},
                 "model_id": {
@@ -1418,14 +1436,10 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"},
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM,
                 "text": {"type": "string", "description": "要发送的提示词内容"},
-                "timeout_secs": {
-                    "type": "integer",
-                    "description": "最长等待秒数,默认 120",
-                    "default": 120,
-                },
+                "timeout_secs": _SHARED_TIMEOUT_PARAM,
                 "auto_permission": {
                     "type": "string",
                     "enum": ["once", "always", "reject", "manual"],
@@ -1468,13 +1482,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"},
-                "timeout_secs": {
-                    "type": "integer",
-                    "description": "最长等待秒数,默认 120",
-                    "default": 120,
-                },
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM,
+                "timeout_secs": _SHARED_TIMEOUT_PARAM,
             },
             "required": ["session_id"],
             "additionalProperties": False,
@@ -1491,8 +1501,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"},
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM,
                 "limit": {
                     "type": "integer",
                     "description": "返回的消息条数上限,默认 50",
@@ -1516,8 +1526,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"},
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM,
                 "request_id": {"type": "string", "description": "权限请求 ID(per_...)"},
                 "decision": {
                     "type": "string",
@@ -1539,8 +1549,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"},
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM,
                 "form_id": {"type": "string", "description": "表单 ID(frm_...)"},
                 "answer": {
                     "type": "object",
@@ -1563,7 +1573,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},},
+                "server": _SHARED_SERVER_PARAM,},
             "required": [],
             "additionalProperties": False,
         },
@@ -1574,8 +1584,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"}
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM
             },
             "required": ["session_id"],
             "additionalProperties": False,
@@ -1590,8 +1600,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"}
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM
             },
             "required": ["session_id"],
             "additionalProperties": False,
@@ -1606,7 +1616,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
+                "server": _SHARED_SERVER_PARAM,
                 "search": {"type": "string", "description": "按标题/内容搜索的关键词(可选)"},
                 "limit": {
                     "type": "integer",
@@ -1636,13 +1646,9 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"},
-                "timeout_secs": {
-                    "type": "integer",
-                    "description": "最长等待秒数,默认 120",
-                    "default": 120,
-                },
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM,
+                "timeout_secs": _SHARED_TIMEOUT_PARAM,
             },
             "required": ["session_id"],
             "additionalProperties": False,
@@ -1657,8 +1663,8 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
-                "session_id": {"type": "string", "description": "会话 ID(ses_...)"}
+                "server": _SHARED_SERVER_PARAM,
+                "session_id": _SHARED_SESSION_ID_PARAM
             },
             "required": ["session_id"],
             "additionalProperties": False,
@@ -1673,7 +1679,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "server": {"type": "string", "description": "(可选)目标连接名,缺省 local;带 session_id 的调用可自动路由到创建它的连接"},
+                "server": _SHARED_SERVER_PARAM,
                 "session_id": {"type": "string", "description": "要删除的会话 ID(ses_...)"}
             },
             "required": ["session_id"],
