@@ -80,9 +80,10 @@ All tools accept an optional `server` parameter; calls carrying a `session_id` a
 
 ## Docs
 
-- [Connection model, environment variables, cancellation](docs/connection-model.md)
-- [Sessions, agents and model selection](docs/sessions.md)
-- [Permission and form flows, permission rules](docs/interactions.md)
-- [Subagent-aware waiting in multi-agent sessions](docs/subagent-waiting.md)
-- [Verified flows and testing](docs/verification.md)
-- [Design record: remote connections](DESIGN-remote-connections.md)
+- [Connection model, environment variables, cancellation](docs/connection-model.md) · [中文](docs/connection-model.zh-CN.md)
+- [Sessions, agents and model selection](docs/sessions.md) · [中文](docs/sessions.zh-CN.md)
+- [Permission and form flows, permission rules](docs/interactions.md) · [中文](docs/interactions.zh-CN.md)
+- [Subagent-aware waiting in multi-agent sessions](docs/subagent-waiting.md) · [中文](docs/subagent-waiting.zh-CN.md)
+- [Tool reference](docs/tools.md) · [中文](docs/tools.zh-CN.md)
+- [Verified flows and testing](docs/verification.md) · [中文](docs/verification.zh-CN.md)
+- [Design record: remote connections](DESIGN-remote-connections.md) · [中文](DESIGN-remote-connections.zh-CN.md)

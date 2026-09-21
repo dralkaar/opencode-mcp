@@ -1,5 +1,7 @@
 # Connection model: MCP-spawned local + multi-server
 
+**English** | [中文](connection-model.zh-CN.md)
+
 Part of the [opencode-mcp](../README.md) documentation.
 
 **No inferential service discovery (including `service.json`).** The local connection takes one of two forms:
@@ -20,7 +22,7 @@ Part of the [opencode-mcp](../README.md) documentation.
 - `OPENCODE_MCP_WORKERS`: worker threads for request handling, default `4` (set to `1` for strict serialization).
 - `OPENCODE_MCP_BASELINE_VERSION`: overrides the development baseline (default `2.0.12`, mainly for testing).
 
-# Concurrency and cancellation
+## Concurrency and cancellation
 
 Part of the [opencode-mcp](../README.md) documentation.
 

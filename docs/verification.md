@@ -1,5 +1,7 @@
 # Verified flows
 
+**English** | [中文](verification.zh-CN.md)
+
 Part of the [opencode-mcp](../README.md) documentation.
 
 All verified live against opencode v2.0.12:
@@ -15,7 +17,7 @@ All verified live against opencode v2.0.12:
 9. **Host integrations**: mounted as a tool provider in the Hermes agent gateway; hosted by the oh-my-opencode-slim orchestration framework to drive nested opencode sessions.
 10. **Subagent-aware waiting**: a session delegating a background subagent that blocks on a `shell` approval — `wait_session` (default) returns `needs_permission` naming the **subagent's** session (plus `root_session_id`) instead of a premature `succeeded`, while `chat` (default) returns `succeeded` but reports `pending_subagents: 1`. Also verified: three parallel subagents each awaiting approval, a subagent blocked on a form, `auto_permission="once"` answering a subagent's request and then reaching `succeeded`, and the same flow over a remote connection where the reply routes correctly without an explicit `server`.
 
-# Testing
+## Testing
 
 Part of the [opencode-mcp](../README.md) documentation.
 

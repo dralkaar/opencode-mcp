@@ -1,5 +1,7 @@
 # Design: multiple opencode connections (implemented)
 
+**English** | [中文](DESIGN-remote-connections.zh-CN.md)
+
 Status: **implemented** (2026-09-22). `connect_server` / `list_servers` / `disconnect_server`, the `server` parameter on every tool, session auto-routing, MCP-spawned local serve, and failure classification are all in place and live-verified.
 
 ## Decisions (2026-09-22, confirmed with the project owner)
@@ -19,7 +21,7 @@ Status: **implemented** (2026-09-22). `connect_server` / `list_servers` / `disco
 - `connect_server(name, url, password_file?, password_env?, password?)` — registers and validates, returning `{name, version, baseline, baseline_check}`; credentials resolved in the priority order above.
 - `list_servers()` — local + dynamic remotes: version and baseline status.
 - `disconnect_server(name)` — removes a remote (`local` is not removable).
-- All tools: optional `server` parameter + session auto-routing.
+- All other tools: optional `server` parameter + session auto-routing.
 
 ## Internal refactoring scope
 

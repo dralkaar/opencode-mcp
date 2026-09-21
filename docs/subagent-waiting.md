@@ -1,5 +1,7 @@
 # Subagent-aware waiting (multi-agent sessions)
 
+**English** | [中文](subagent-waiting.zh-CN.md)
+
 Part of the [opencode-mcp](../README.md) documentation.
 
 A session can delegate to subagent sessions and then end its own turn **while they keep working**. opencode's `outcome` is per-turn — it means "this session has no generation running right now", not "the task is done" — so a naive wait reports success while delegated work is still in flight and can even leave a subagent blocked on an approval nobody will ever see.

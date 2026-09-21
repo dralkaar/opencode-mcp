@@ -1,5 +1,7 @@
 # Model selection
 
+**English** | [中文](sessions.zh-CN.md)
+
 Part of the [opencode-mcp](../README.md) documentation.
 
 - This MCP **never pins models on the caller's behalf**: `create_session` without `model_id` leaves `model=null`, and the run falls back to the **location default model** (`GET /api/model/default`).

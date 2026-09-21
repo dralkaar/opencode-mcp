@@ -78,9 +78,10 @@
 
 ## 文档
 
-- [连接模型、环境变量、取消](docs/connection-model.md)
-- [会话、agent 与模型选择](docs/sessions.md)
-- [权限与表单流程、权限规则](docs/interactions.md)
-- [多 agent 会话中的子会话感知等待](docs/subagent-waiting.md)
-- [已验证流程与测试](docs/verification.md)
-- [设计记录:远端连接](DESIGN-remote-connections.md)
+- [连接模型、环境变量、取消](docs/connection-model.zh-CN.md) · [English](docs/connection-model.md)
+- [会话、agent 与模型选择](docs/sessions.zh-CN.md) · [English](docs/sessions.md)
+- [权限与表单流程、权限规则](docs/interactions.zh-CN.md) · [English](docs/interactions.md)
+- [多 agent 会话中的子会话感知等待](docs/subagent-waiting.zh-CN.md) · [English](docs/subagent-waiting.md)
+- [工具参数参考](docs/tools.zh-CN.md) · [English](docs/tools.md)
+- [已验证流程与测试](docs/verification.zh-CN.md) · [English](docs/verification.md)
+- [设计记录:远端连接](DESIGN-remote-connections.zh-CN.md) · [English](DESIGN-remote-connections.md)

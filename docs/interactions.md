@@ -1,5 +1,7 @@
 # Permission and form flows
 
+**English** | [中文](interactions.zh-CN.md)
+
 Part of the [opencode-mcp](../README.md) documentation.
 
 ### Automatic mode (default locally)
@@ -28,7 +30,7 @@ Part of the [opencode-mcp](../README.md) documentation.
 2. Answer with `form_reply(form_id, answer)`.
 3. Call `wait_session` to continue until terminal.
 
-# Permission rules and action naming
+## Permission rules and action naming
 
 Part of the [opencode-mcp](../README.md) documentation.
 
