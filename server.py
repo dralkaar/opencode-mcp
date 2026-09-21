@@ -822,11 +822,12 @@ def _active_session_ids(conn):
         if _is_capability_error(exc):
             _mark_capability_unsupported(conn, CAP_SESSION_ACTIVE, exc)
         return None, False
-    data = unwrap(payload)
-    if not isinstance(data, dict):
+    # The measured shape is {"data": {session_id: {"type": "running"}}}; a payload without that
+    # wrapper is UNKNOWN (fail-closed), never an empty active set.
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
         return None, False
     active = set()
-    for sid, value in data.items():
+    for sid, value in payload["data"].items():
         if not isinstance(sid, str) or not isinstance(value, dict):
             return None, False
         active.add(sid)
@@ -863,6 +864,8 @@ def _subtree_ids(conn, root_id):
                 _mark_capability_unsupported(conn, CAP_SESSION_PARENTID, exc)
             return None
         data = unwrap(payload)
+        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+            data = data["sessions"]  # tolerate the sessions-wrapped variant list_sessions also accepts
         if not isinstance(data, list):
             return None
         for child in data:
@@ -928,13 +931,45 @@ def _fetch_global_pending(conn, path, cap):
             _mark_capability_unsupported(conn, cap, exc)
             return None, "unsupported"
         return None, "unknown"
-    data = unwrap(payload)
-    if not isinstance(data, list):
+    # The measured shape is {"location": ..., "data": [...]}; a payload without that wrapper is
+    # UNKNOWN (fail-closed), never "nothing pending".
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         return None, "unknown"
-    for item in data:
+    for item in payload["data"]:
         if not isinstance(item, dict):
             return None, "unknown"
-    return data, "ok"
+    return payload["data"], "ok"
+
+
+def _session_pending(conn, sid, kind):
+    """Strict per-session pending list for one node: (items, verified).
+
+    The forgiving fetch_permissions/fetch_forms helpers coerce anything to [], which would turn a
+    malformed or empty-bodied response into "nothing pending" and let a false success through, so
+    this fallback path checks the shape itself and re-adds the owner id that per-session entries omit.
+    """
+    try:
+        payload = http_request(
+            conn,
+            "GET",
+            "/api/session/%s/%s" % (urllib.parse.quote(sid, safe=""), kind),
+        )
+    except OpenCodeError as exc:
+        log("[opencode-mcp] per-session %s lookup failed" % kind, sid, exc)
+        return None, False
+    data = unwrap(payload)
+    if not isinstance(data, list):
+        return None, False
+    items = []
+    for item in data:
+        if not isinstance(item, dict):
+            return None, False
+        if kind == "form" and not _is_pending_form(item):
+            continue
+        if not item.get("sessionID"):
+            item = dict(item, sessionID=sid)
+        items.append(item)
+    return items, True
 
 
 def _pending_interactions_tree(conn, session_ids):
@@ -957,24 +992,11 @@ def _pending_interactions_tree(conn, session_ids):
             verified = False
         else:
             for sid in session_ids:
-                try:
-                    node_perms = fetch_permissions(conn, sid)
-                except OpenCodeError:
+                items, ok = _session_pending(conn, sid, "permission")
+                if not ok:
                     verified = False
                     break
-                if not isinstance(node_perms, list):
-                    verified = False
-                    break
-                for p in node_perms:
-                    if not isinstance(p, dict):
-                        verified = False
-                        break
-                    if not p.get("sessionID"):
-                        p = dict(p, sessionID=sid)
-                    if p.get("sessionID") in idset:
-                        perms.append(p)
-                if not verified:
-                    break
+                perms.extend(p for p in items if p.get("sessionID") in idset)
 
     forms, fstat = _fetch_global_pending(conn, "/api/form", CAP_GLOBAL_FORM)
     if fstat == "ok":
@@ -985,21 +1007,11 @@ def _pending_interactions_tree(conn, session_ids):
             verified = False
         else:
             for sid in session_ids:
-                try:
-                    node_forms = fetch_forms(conn, sid, pending_only=True)
-                except OpenCodeError:
+                items, ok = _session_pending(conn, sid, "form")
+                if not ok:
                     verified = False
                     break
-                for f in node_forms:
-                    if not isinstance(f, dict):
-                        verified = False
-                        break
-                    if not f.get("sessionID"):
-                        f = dict(f, sessionID=sid)
-                    if f.get("sessionID") in idset:
-                        forms.append(f)
-                if not verified:
-                    break
+                forms.extend(f for f in items if f.get("sessionID") in idset)
 
     if not verified:
         return {"permissions": [], "forms": [], "verified": False}
@@ -1040,7 +1052,9 @@ def _subtree_snapshot(conn, root_id):
     if tree["truncated"]:
         # Never declare success on a truncated tree; still report what we saw for diagnostics.
         base["subagents"] = _subagent_entries(tree, active)
-        base["pending_subagents"] = sum(1 for sid in ids if sid in active)
+        base["pending_subagents"] = sum(
+            1 for sid in ids if sid != root_id and sid in active
+        )
         return base
 
     inter = _pending_interactions_tree(conn, ids)
@@ -1050,7 +1064,9 @@ def _subtree_snapshot(conn, root_id):
     base["verified"] = True
     base["permissions"] = inter["permissions"]
     base["forms"] = inter["forms"]
-    base["pending_subagents"] = sum(1 for sid in ids if sid in active)
+    base["pending_subagents"] = sum(
+        1 for sid in ids if sid != root_id and sid in active
+    )
     return base
 
 
@@ -1079,13 +1095,18 @@ def _attach_subtree(payload, snap):
     return payload
 
 
-def _autoreply_subtree_permissions(conn, snap, decision):
-    """Answer every pending permission in the subtree by POSTing to each request's own session."""
+def _autoreply_subtree_permissions(conn, snap, decision, replied):
+    """Answer every pending permission in the subtree by POSTing to each request's own session.
+
+    `replied` carries the ids already answered in this wait, so a request that stays visible for
+    more than one poll is not re-POSTed every second.
+    """
     for req in snap.get("permissions") or []:
         rid = req.get("id")
         owner = req.get("sessionID")
-        if not rid or not owner:
+        if not rid or not owner or rid in replied:
             continue
+        replied.add(rid)
         try:
             http_request(
                 conn,
@@ -1113,9 +1134,13 @@ def _enrich_forms(conn, forms):
     out = []
     for owner in owners:
         try:
-            out.extend(fetch_forms(conn, owner, pending_only=True))
+            node_forms = fetch_forms(conn, owner, pending_only=True)
         except OpenCodeError:
             return forms
+        for form in node_forms:
+            if isinstance(form, dict) and not form.get("sessionID"):
+                form = dict(form, sessionID=owner)  # per-session forms omit the owner id
+            out.append(form)
     return out or forms
 
 
@@ -1252,7 +1277,7 @@ def _run_until_terminal(
     """
     started = time.monotonic()
     gate_created = None
-    last_subtree_unknown = False
+    replied_permissions = set()  # ids already auto-replied: never re-POST the same request each poll
     while True:
         if _current_request_cancelled():
             return "cancelled", {"status": "cancelled", "note": "The caller cancelled this request"}
@@ -1263,11 +1288,12 @@ def _run_until_terminal(
         except OpenCodeError:
             permissions = []
         if permissions:
-            if auto_permission in ("once", "always", "reject"):
+            if auto_permission in SUBTREE_AUTOREPLY:
                 for req in permissions:
                     rid = req.get("id")
-                    if not rid:
+                    if not rid or rid in replied_permissions:
                         continue
+                    replied_permissions.add(rid)
                     try:
                         http_request(
                             conn,
@@ -1366,9 +1392,6 @@ def _run_until_terminal(
                     if outcome == "succeeded":
                         snap = _subtree_snapshot(conn, session_id)
                         _attach_subtree(payload, snap)
-                        last_subtree_unknown = (not snap["verified"]) and (
-                            not snap["legacy"]
-                        )
                     return outcome, payload
 
                 # succeeded + wait_for_subagents: the parent outcome is per-turn, so accept it
@@ -1396,12 +1419,11 @@ def _run_until_terminal(
 
                 # Not quiescent (or UNKNOWN). UNKNOWN must never become success: keep polling
                 # until the timeout, then report a timeout diagnostic.
-                last_subtree_unknown = not snap["verified"]
                 if snap["verified"]:
                     if snap["permissions"]:
                         if auto_permission in SUBTREE_AUTOREPLY:
                             _autoreply_subtree_permissions(
-                                conn, snap, auto_permission
+                                conn, snap, auto_permission, replied_permissions
                             )
                         else:
                             return "needs_permission", _subtree_needs_payload(
@@ -1426,16 +1448,16 @@ def _run_until_terminal(
                 if baseline is None or m.get("id") not in (baseline or set())
             ]
             snap = _subtree_snapshot(conn, session_id)
-            if last_subtree_unknown:
-                note = (
-                    "Wait timed out (%s seconds); the session is still generating. "
-                    "Subagent activity could not be verified (fail-closed): the terminal state was not accepted."
-                    % timeout_secs
-                )
-            elif snap.get("truncated"):
+            if snap.get("truncated"):
                 note = (
                     "Wait timed out (%s seconds); the session is still generating. "
                     "The subagent subtree was truncated by the depth/node caps, so quiescence could not be confirmed."
+                    % timeout_secs
+                )
+            elif not snap.get("verified") and not snap.get("legacy"):
+                note = (
+                    "Wait timed out (%s seconds); the session is still generating. "
+                    "Subagent activity could not be verified (fail-closed): the terminal state was not accepted."
                     % timeout_secs
                 )
             else:
