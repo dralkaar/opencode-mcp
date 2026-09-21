@@ -76,6 +76,8 @@ SESSION_ROUTE_LIMIT = 1000
 _CONNECTIONS = {}  # name -> Connection(_STATE_LOCK 保护)
 _SESSION_ROUTE = {}  # session_id -> connection name(插入序,超限淘汰最旧)
 _LOCAL_LOCK = threading.Lock()
+# 注册串行锁:同名并发 connect 的检查-写入竞态靠它消除(注册是低频操作)
+_REGISTER_LOCK = threading.Lock()
 
 
 class Connection:
@@ -88,7 +90,6 @@ class Connection:
         self.is_local = is_local
         self.source = source  # spawned / env / dynamic
         self.server_version = None
-        self.version_checked = False
         self.sessions_warned = {}  # session_id -> 告警时的 server_version
         self.spawned_proc = None
 
@@ -180,7 +181,6 @@ def _ensure_version(conn):
             kind="compatibility",
         )
     conn.server_version = info["version"]
-    conn.version_checked = True
     return info
 
 
@@ -231,12 +231,15 @@ def _spawn_local_serve():
                 info = _raw_probe(conn, timeout=2.0)
                 if isinstance(info, dict) and info.get("version"):
                     conn.server_version = info["version"]
-                    conn.version_checked = True
                     return conn
             except Exception:
                 pass
             time.sleep(0.3)
         proc.kill()
+        try:
+            proc.wait(timeout=5)  # 回收子进程,避免 zombie
+        except Exception:
+            pass
     raise OpenCodeError(
         "[availability] 本地 opencode serve 拉起失败(3 个随机端口均未就绪):%s"
         % last_err,
@@ -279,15 +282,17 @@ def _register_connection(name, base_url, password):
         raise OpenCodeError("缺少必填参数 name")
     if name == DEFAULT_LOCAL_NAME:
         raise OpenCodeError("连接名 %r 为保留名,不可使用" % name)
-    with _STATE_LOCK:
-        if name in _CONNECTIONS:
-            raise OpenCodeError(
-                "连接名已存在:%s(用 list_servers 查看)" % name
-            )
-    conn = Connection(name, base_url, password, is_local=False, source="dynamic")
-    _ensure_version(conn)  # 创建时检查(硬门禁)
-    with _STATE_LOCK:
-        _CONNECTIONS[name] = conn
+    # 全程串行:消除同名并发注册的检查-写入竞态(注册低频,串行无碍)
+    with _REGISTER_LOCK:
+        with _STATE_LOCK:
+            if name in _CONNECTIONS:
+                raise OpenCodeError(
+                    "连接名已存在:%s(用 list_servers 查看)" % name
+                )
+        conn = Connection(name, base_url, password, is_local=False, source="dynamic")
+        _ensure_version(conn)  # 创建时检查(硬门禁)
+        with _STATE_LOCK:
+            _CONNECTIONS[name] = conn
     return conn
 
 
@@ -367,6 +372,8 @@ def _warn_for_result(conn, session_id, result):
         if conn.sessions_warned.get(session_id) == conn.server_version:
             return result
         conn.sessions_warned[session_id] = conn.server_version
+        while len(conn.sessions_warned) > 2000:
+            conn.sessions_warned.pop(next(iter(conn.sessions_warned)))
     result = dict(result)
     result["api_version_warning"] = warning
     return result
@@ -491,6 +498,12 @@ def _classify_failure(conn, method, path, original, http_status=None):
         conn.server_version,
         DEVELOPMENT_BASELINE_VERSION,
     )
+    if http_status in (401, 403):
+        raise OpenCodeError(
+            "[availability] %s 认证被拒(HTTP %s):密码错误或已失效(%s)。原始:%s"
+            % (conn.name, http_status, ctx, original),
+            kind="availability",
+        )
     if http_status == 404 and method == "GET":
         raise OpenCodeError(
             "[compatibility] 端点消失(GET %s -> 404),疑似 API 重构(%s)。原始:%s"
@@ -625,19 +638,25 @@ def _format_message(message):
     return result
 
 
-def fetch_messages(conn, session_id, order="asc", limit=100):
+def fetch_messages(conn, session_id, limit=100):
+    """取会话**最新的** limit 条消息,按时间升序返回。
+
+    实测 opencode 的 order=asc&limit 返回"最早 N 条"(在 200+ 消息会话上验证),
+    长会话会导致 gate 查找 / 增量游标错位;故统一用 order=desc 取尾部窗口后反转。
+    """
     payload = http_request(
         conn,
         "GET",
         "/api/session/%s/message" % urllib.parse.quote(session_id, safe=""),
-        query={"order": order, "limit": limit},
+        query={"order": "desc", "limit": limit},
     )
     data = unwrap(payload)
-    if isinstance(data, list):
-        return data
     if isinstance(data, dict) and isinstance(data.get("messages"), list):
-        return data["messages"]
-    return []
+        data = data["messages"]
+    if not isinstance(data, list):
+        return []
+    data.reverse()
+    return data
 
 
 def fetch_permissions(conn, session_id):
@@ -893,8 +912,9 @@ def _run_until_terminal(
 # ---------------------------------------------------------------------------
 
 def _arg_timeout(args, default=120):
-    """解析可选的 timeout_secs 参数。"""
-    return int(args.get("timeout_secs", default) or default)
+    """解析可选的 timeout_secs 参数,并夹取到 [1, 3600] 秒。"""
+    value = int(args.get("timeout_secs", default) or default)
+    return max(1, min(value, 3600))
 
 
 def tool_create_session(args):
@@ -1045,7 +1065,7 @@ def tool_get_messages(args):
     _route_session(session_id, conn)
     if after:
         # 增量拉取:取最近最多 200 条,截掉 after_message_id 及之前的
-        messages = fetch_messages(conn, session_id, order="asc", limit=200)
+        messages = fetch_messages(conn, session_id, limit=200)
         idx = next(
             (i for i, m in enumerate(messages) if m.get("id") == after), -1
         )
@@ -1056,7 +1076,7 @@ def tool_get_messages(args):
         if len(messages) > limit:
             messages = messages[-limit:]
     else:
-        messages = fetch_messages(conn, session_id, order="asc", limit=limit)
+        messages = fetch_messages(conn, session_id, limit=limit)
     messages = sorted(
         messages, key=lambda m: (m.get("time") or {}).get("created") or 0
     )
@@ -1443,7 +1463,7 @@ TOOLS = [
                 "auto_permission": {
                     "type": "string",
                     "enum": ["once", "always", "reject", "manual"],
-                    "description": "对权限请求的处理方式,默认 once(本次允许)。manual 表示不做自动答复,交由调用方处理。",
+                    "description": "对权限请求的处理方式。本地连接默认 once(本次允许);远端连接默认 manual(审批必在调用方)。可显式指定 once/always/reject/manual。",
                     "default": "once",
                 },
                 "delivery": {
@@ -1794,9 +1814,6 @@ def handle_message(message):
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             },
         }
-
-    if method in ("notifications/initialized", "initialized", "notifications/cancelled"):
-        return None
 
     if method == "ping":
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
