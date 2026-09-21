@@ -10,7 +10,7 @@
 | 寻址模型 | 命名别名 + session 自动路由 | 工具加可选 `server` 参数(缺省 local);`create_session(server=X)` 记录 `ses_→X` 映射,后续带 session_id 的调用免传;不做隐式 current 切换 |
 | 句柄语义 | 无 fd/socket;别名即句柄 | MCP 调用方(LLM)只能持有字符串;`ses_` id 全局唯一,session 不需要回传连接 handle |
 | 持久化 | **仅动态,永不支持静态配置** | "记忆常用连接不是工具的责任,工具不该代替 memory 和 skill 的位置"——连接由调用方按需建立,进程重启即失,由调用方自行重连 |
-| 密码通道 | **本地文件 > env > 明文** | 文件通道允许调用方用特殊能力生成凭据(如 askpass 类安全输入);env 多 server 需错开命名,不便;明文最差,仅兜底;无任何凭据来源时不发送 Authorization 头(实测存在空用户名/密码的远端,如 100.94.120.105:4096——当前网络层不可达待排查) |
+| 密码通道 | **本地文件 > env > 明文** | 文件通道允许调用方用特殊能力生成凭据(如 askpass 类安全输入);env 多 server 需错开命名,不便;明文最差,仅兜底;无任何凭据来源时不发送 Authorization 头(实测存在无需认证/空凭据的远端形态;另注意:凭据错误时请求可能落到 Web UI 回退,连接器会以 compatibility 报错提示检查密码) |
 | 版本基准与漂移裁定 | **已定案** | ①创建时检查:connect_server / local 首连即硬门禁(连不上=可用性错;无 version=兼容性错);②后续调用仅当失败后重查版本号,据此分类失败:可用性 / 兼容性 / 其他(其他需 dump 具体报错便于回报开发者);③告警 per-(connection, session),按已告警版本去重(新会话可见、同会话不轰炸、版本变化后新会话按新版本告警);④显式状态面:connect_server 返回与 list_servers |
 | 远端权限默认 | **manual(已定案)** | 远端连接 chat 默认 `auto_permission="manual"`(审批过程必在调用方,强于 once);`once/always/reject` 均保留、由调用方显式选用,**不额外限制 always**;本地维持 once 默认;交互式审批 UI 归调用方,MCP 只负责把 needs_permission 详情给足 |
 
