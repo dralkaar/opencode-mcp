@@ -1,405 +1,198 @@
 # opencode-mcp
 
-一个用**纯 Python 3 标准库**实现的 MCP(Model Context Protocol)stdio server,用于操作**本机 opencode** 的对话能力(创建会话、发送消息、轮询回复、处理权限与表单、中断生成)。
+**English** | [中文](README.zh-CN.md)
 
-## 简介
+An MCP (Model Context Protocol) stdio server implemented in the **pure Python 3 standard library**, for driving **opencode** conversations programmatically: create sessions, send prompts, wait for replies, handle permission requests and forms, compact context, and manage multiple opencode servers.
 
-- 协议:MCP over stdio,每行一个 JSON-RPC 2.0 消息(**换行分隔**,不是 LSP 的 `Content-Length` 帧)。
-- 提供的工具:`create_session` / `chat` / `wait_session` / `get_messages` / `list_agents` / `list_sessions` / `compact` / `get_context` / `delete_session` / `permission_reply` / `form_reply` / `interrupt` / `pending_interactions` / `connect_server` / `list_servers` / `disconnect_server`(共 16 个;全部支持可选 `server` 参数)。
-- 通过 opencode 的本地 HTTP API 通信:从 `service.json` 读取地址与密码,使用 HTTP Basic 鉴权(用户名固定 `opencode`)。
-- **懒连接**:`initialize` 阶段不做任何网络请求,第一次真正调用工具时才探活。
+Zero third-party dependencies. All capabilities are live-tested against opencode v2.0.12, including a real remote end-to-end run.
 
-## 零依赖说明
+## Design in one paragraph
 
-只依赖 Python 3 标准库(`json` / `urllib` / `base64` / `subprocess` 等),**不需要也不允许 `pip install` 任何第三方包**。要求 Python 3.13,源码统一 UTF-8,输出 JSON 使用 `ensure_ascii=False`。
+MCP is a stdio JSON-RPC 2.0 server (newline-delimited, not LSP Content-Length framing). It speaks to opencode's HTTP API over a connection layer. Local opencode is either connected explicitly via `OPENCODE_URL` or **spawned by the MCP itself** (random high port, random password, child process lifetime). Remote opencode instances are registered dynamically with `connect_server` and addressed by alias; sessions remember which connection they live on and route automatically. Terminal states are judged solely from the authoritative `Session.outcome` field — never from message-shape heuristics.
 
-## 连接模型:本地拉起 + 多服务器
+## Connection model: MCP-spawned local + multi-server
 
-**禁止推断性自发现(含 service.json)。** 本地连接两种形态:
+**No inferential service discovery (including `service.json`).** The local connection takes one of two forms:
 
-1. **显式直连**:`OPENCODE_URL` 设置时,local 直接指向该地址(密码取 `OPENCODE_PASSWORD`,缺省 `opencode`)。
-2. **专属拉起**(默认):首次需要 local 时,MCP 自己拉起一个 `opencode serve`——**随机高位端口 + 随机密码**(经 `OPENCODE_SERVER_PASSWORD` 注入),子进程模式随本 MCP 实例生命周期退出;多个 MCP 实例靠随机端口互不冲突。`PATH` 中无 `opencode` 时返回可用性错误(用户环境问题,不重试)。
+1. **Explicit direct connect**: when `OPENCODE_URL` is set, `local` points at that address (password from `OPENCODE_PASSWORD`, default `opencode`).
+2. **MCP-spawned serve** (default): the first time `local` is needed, the MCP spawns its own `opencode serve` — **random high port + random password** injected via `OPENCODE_SERVER_PASSWORD`. It runs as a child process and dies with the MCP instance; multiple MCP instances never collide thanks to the random ports. If `opencode` is not on `PATH`, the call fails with an availability error (user environment issue, no retries).
 
-**多服务器**:`connect_server(name, url, password_file?/password_env?/password?)` 注册远端(仅进程内有效,不持久化);全部工具带可选 `server` 参数(缺省 local);带 `session_id` 的调用自动路由到创建该会话的连接。凭据优先级:**文件 > env > 明文**;全部缺省时不发送 Authorization 头(存在空用户名/密码的远端)。
+**Multi-server**: `connect_server(name, url, password_file?/password_env?/password?)` registers a remote connection (process-lifetime only, never persisted). Every tool accepts an optional `server` parameter (defaults to `local`); calls carrying a `session_id` are routed automatically to the connection that owns that session. Credential priority: **file > env > plaintext**; when no credential source is given, no `Authorization` header is sent (some remotes accept no auth).
 
-**版本基准与失败分类**:每个连接创建时硬门禁(连不上=`[availability]`;可达但非 opencode API=`[compatibility]`);调用失败后重查版本,据此分类为 `[availability] / [compatibility] / [other]`(other 附完整原始报错,可原样回报开发者)。版本与基准不一致时,向触碰该连接会话的**第一个工具结果**注入一次 `api_version_warning`(按 (连接, 会话, 版本) 去重,新会话可见、同会话不轰炸)。
+**Version baseline and failure classification**: every connection is hard-gated at creation (unreachable = `[availability]`; reachable but not an opencode API = `[compatibility]`). After a request failure the version is re-queried and the failure is classified as `[availability] / [compatibility] / [other]` — `other` carries the full original error for reporting. When a server version differs from the development baseline, a single `api_version_warning` is injected into the first tool result touching each (connection, session, version) pair — new sessions see it, the same session is never spammed.
 
-**权限默认**:本地连接 chat 默认 `auto_permission="once"`;**远端连接默认 `manual`**(审批过程必在调用方);`once/always/reject` 均可显式选用。
+**Permission defaults**: local `chat` defaults to `auto_permission="once"`; **remote connections default to `manual`** (approval must live with the caller); `once/always/reject` can always be chosen explicitly.
 
-### 环境变量
+### Environment variables
 
-- `OPENCODE_URL`:显式指定 local 直连地址(跳过拉起),例如 `http://127.0.0.1:4096`。
-- `OPENCODE_PASSWORD`:local 直连的 HTTP Basic 密码;用户名固定 `opencode`,缺省 `opencode`。
-- `OPENCODE_MCP_WORKERS`:请求处理线程数,默认 `4`。设为 `1` 则退化为严格串行。
-- `OPENCODE_MCP_BASELINE_VERSION`:开发基准版本覆盖(默认 `2.0.12`,主要用于测试)。
+- `OPENCODE_URL`: explicit local address (skips spawning), e.g. `http://127.0.0.1:4096`.
+- `OPENCODE_PASSWORD`: HTTP Basic password for the explicit local connection; username is always `opencode`, default password `opencode`.
+- `OPENCODE_MCP_WORKERS`: worker threads for request handling, default `4` (set to `1` for strict serialization).
+- `OPENCODE_MCP_BASELINE_VERSION`: overrides the development baseline (default `2.0.12`, mainly for testing).
 
-## 并发与取消
+## Concurrency and cancellation
 
-- **并发**:每个 JSON-RPC 请求在独立工作线程中处理(`OPENCODE_MCP_WORKERS` 控制,默认 4)。`chat` / `wait_session` 这类长阻塞调用不会卡住其他工具调用。
-- **取消**:支持 MCP 标准的 `notifications/cancelled`。调用方取消 `chat` / `wait_session` 后,轮询会在 1 秒内停止(该请求不再回写响应;正在途中的单次 HTTP 请求最长 30 秒自然超时)。
+- **Concurrency**: each JSON-RPC request is handled in its own worker thread (`OPENCODE_MCP_WORKERS`, default 4). Long-blocking calls such as `chat` / `wait_session` never block other tool calls.
+- **Cancellation**: MCP-standard `notifications/cancelled` is honored. Cancelling `chat` / `wait_session` stops polling within 1 second (the request no longer writes a response; a single in-flight HTTP request can take up to its 30-second timeout to unwind).
 
-## 版本基准与告警
+## Version baseline and warnings
 
-版本与告警机制已并入「连接模型:本地拉起 + 多服务器」一节:每连接创建时硬门禁、失败后重查版本并分类(availability / compatibility / other)、告警按 (连接, 会话, 版本) 去重注入。基准版本默认 `2.0.12`,可用 `OPENCODE_MCP_BASELINE_VERSION` 覆盖(主要用于测试)。
+Covered by the connection-model section above: per-connection hard gate at creation, version re-query and failure classification after errors, and warnings de-duplicated per (connection, session, version). Baseline defaults to `2.0.12`, overridable with `OPENCODE_MCP_BASELINE_VERSION`.
 
-## 模型选择说明
+## Model selection
 
-- 本 MCP **不替调用方钉扎模型**:`create_session` 不传 `model_id` 时,会话 `model=null`,运行时会回落到 **位置默认模型**(可通过 `GET /api/model/default` 查询)。
-- 实测(opencode v2.0.12):位置默认模型**不会**跟随 agent 配置——TUI 和 opencode 内部 spawn 在创建会话时会显式钉模型,裸 API 建的会话则回落位置默认。需要指定模型时显式传 `model_id`(格式 `providerID/modelID`)。
-- **读取 agent→模型映射**:用 `list_agents` 工具(数据来自 `GET /api/agent`,已包含插件解析结果)。想与会话与某 agent 的行为对齐,由调用方读取映射后显式传 `model_id`。
+- This MCP **never pins models on the caller's behalf**: `create_session` without `model_id` leaves `model=null`, and the run falls back to the **location default model** (`GET /api/model/default`).
+- Measured behavior (opencode v2.0.12): the location default does **not** follow agent configuration — the TUI and opencode's internal spawning pin models explicitly at session creation, while bare-API sessions fall back to the location default. Pass `model_id` (`providerID/modelID`) explicitly when you need a specific model.
+- **Reading the agent → model mapping**: use the `list_agents` tool (backed by `GET /api/agent`, plugin-resolved). To align a session with an agent's model, read the mapping and pass `model_id` yourself.
 
-
-
-## 注册到 opencode
+## Registering with opencode
 
 ```bash
 opencode mcp add opencode-local -- python3 /root/opencode-mcp/server.py
 ```
 
-也可以直接手动配置(示例):
+## Tools (16)
 
-```json
-{
-  "mcp": {
-    "opencode-local": {
-      "type": "local",
-      "command": ["python3", "/root/opencode-mcp/server.py"]
-    }
-  }
-}
-```
-
-## 工具清单
+All tools accept an optional `server` parameter. Tool results are JSON text with a stable `status` vocabulary: `succeeded / failed / interrupted / needs_permission / needs_form / timeout / cancelled / compaction_failed`.
 
 ### 1. `create_session`
 
-创建一个新的 opencode 会话。
-
-参数:
-
-- `title?: string` — 会话标题。
-- `agent?: string` — 使用的 agent 名称。
-- `model_id?: string` — 模型,格式 `providerID/modelID`,例如 `anthropic/claude-sonnet-4`。
-- `location?: { directory: string }` — 会话的位置,用于**在指定目录/项目创建会话**。按 opencode `Location.PublicRef` 形状透传(`directory` 必填,绝对路径);不传则不指定。
-
-返回:`{ "session_id": "ses_...", "title": ..., "agent": ..., "model": ... }`
-
-```json
-{"name": "create_session", "arguments": {"title": "我的任务", "model_id": "anthropic/claude-sonnet-4"}}
-```
-
-带 `location` 的示例:
-
-```json
-{"name": "create_session", "arguments": {"title": "在项目里工作", "location": {"directory": "/root/my-project"}}}
-```
+Create a session. Optional `title`, `agent`, `model_id` (`providerID/modelID`), `location` (`{"directory": "..."}`). Returns `session_id`, the owning `server`, plus title/agent/model as reported by the API.
 
 ### 2. `chat`
 
-向指定会话发送一条 prompt 并等待回复。内部按 1 秒间隔轮询消息、权限请求与表单请求。
+Send a prompt and wait for the turn to reach a terminal state.
 
-参数:
+Parameters: `session_id` (required), `text` (required), `timeout_secs?` (default 120, clamped 1–3600), `auto_permission?` (defaults: local `once`, remote `manual`), `delivery?` (`steer` redirects a running generation, `queue` waits for the current turn to finish), `files?` (array of `{uri(required), name?, description?}`).
 
-- `session_id: string` — 会话 ID(`ses_...`)。
-- `text: string` — 提示词内容。
-- `timeout_secs?: int` — 最长等待秒数,默认 `120`。
-- `auto_permission?: "once" | "always" | "reject" | "manual"` — 权限处理方式,默认 `once`。
-- `delivery?: "steer" | "queue"` — 发送方式,不传则不下发该字段。`steer` = 运行中直接转向(打断当前生成方向);`queue` = 排队到本轮结束后生效。非法值报错。
-- `files?: [{uri, name?, description?}]` — 随 prompt 附带发送的文件数组,透传为 prompt body 的 `files`。每项 `uri` 必填,缺失则报错。
-
-返回 `status` 的语义:
-
-| status | 含义 | 建议动作 |
-| --- | --- | --- |
-| `succeeded` | 本轮成功结束。含 `assistant_text`(合并后的助手文本)、`tools_used`(工具名与状态)、可选的 `reasoning`、`last_message_id`(增量游标) | 直接使用结果 |
-| `failed` | 本轮失败(会话权威 outcome=failed) | `get_messages` 查看失败前进度 |
-| `interrupted` | 本轮被中断 | 需要的话重新 chat 继续 |
-| `needs_permission` | 有权限请求且 `auto_permission=manual`,未自动答复。含 `requests` 列表(id/action/resources/save) | 调用 `permission_reply` 后调用 `wait_session` |
-| `needs_form` | 有表单需要填写。含 `forms`(字段 key/title/type/required/options/description) | 调用 `form_reply` 后调用 `wait_session` |
-| `timeout` | 超时未完成。含 `partial_text` 与 `diagnostics`(最后消息类型/状态/completed、待处理权限/表单数、建议动作) | 按 `diagnostics.suggested_actions` 处理:`get_messages` / `pending_interactions` / `wait_session` / `interrupt` |
-| `compaction_failed` | 轮询期间检测到压缩消息 `status=failed`(通常由 `compact` 触发)。 | 检查会话状态后重试或改用其他方式 |
-
-终态判定只信会话权威字段 `outcome`(`GET /api/session`):`succeeded / failed / interrupted`;发送过 prompt 时以「`time.idle` 晚于该 prompt 消息的创建时间」确认是本轮的终态(排队/转向时上一轮的旧终态不算)。无消息形状推断。
-
-```json
-{"name": "chat", "arguments": {"session_id": "ses_abc", "text": "列出当前目录文件", "timeout_secs": 120, "auto_permission": "once"}}
-```
-
-带 `delivery` / `files` 的示例:
-
-```json
-{"name": "chat", "arguments": {"session_id": "ses_abc", "text": "根据附件继续", "delivery": "steer", "files": [{"uri": "file:///root/a.md", "name": "a.md", "description": "参考文档"}]}}
-```
+Statuses: `succeeded` (with `assistant_text`, `tools_used`, optional `reasoning`, `last_message_id`), `failed`, `interrupted`, `needs_permission` (with `requests`), `needs_form`, `timeout` (with `partial_text` and `diagnostics`).
 
 ### 3. `wait_session`
 
-**纯状态原语**:等待会话进入终态或待交互状态,不返回消息内容。终态来自会话权威字段 `outcome`。
+**Pure state primitive**: waits until the session reaches a terminal or blocked state. Never returns message content and never answers permissions itself.
 
-参数:`session_id`(必填)、`timeout_secs?`(默认 120)。
+Returns `succeeded / failed / interrupted` (from the authoritative `outcome`), `needs_permission` (`requests`), `needs_form` (`forms` with field key/title/type/required/options/description), or `timeout` (`diagnostics`). Always includes `last_message_id` as the incremental cursor.
 
-返回 `status`:
-- `succeeded` / `failed` / `interrupted` — 本轮终态(含 `last_message_id` 增量游标、`time_idle`)
-- `needs_permission` — 被权限请求阻塞(含 `requests` 列表)
-- `needs_form` — 被表单阻塞(含 `forms` 字段详情)
-- `timeout` — 超时时仍在生成(含 `diagnostics`)
-
-```json
-{"name": "wait_session", "arguments": {"session_id": "ses_abc", "timeout_secs": 120}}
-```
-
-典型组合:答复权限/表单后 `wait_session` 等终态,再 `get_messages(after_message_id=...)` 拉增量回复。
+Typical composition: after answering a permission or form, `wait_session` until terminal, then pull new content with `get_messages(after_message_id=...)`.
 
 ### 4. `get_messages`
 
-按时间升序获取并格式化会话历史。
+Messages in ascending time order, formatted (role, text, tool summaries, timestamps). Supports incremental pulls: pass `after_message_id` (the previous `last_message_id`) to get only newer messages; the response returns a fresh `last_message_id`.
 
-参数:`session_id`(必填)、`limit?`(默认 50)。
-
-返回 `{ "session_id", "count", "messages": [...] }`,每条消息包含 `id`、`type`、`time`;用户/助手消息含 `text`,助手消息另含 `tools`(工具摘要)与 `completed`,工具/推理内容会一并汇总。
-
-```json
-{"name": "get_messages", "arguments": {"session_id": "ses_abc", "limit": 20}}
-```
+Note: the underlying API windows on the **tail** of the conversation (the newest N messages), which keeps long sessions correct.
 
 ### 5. `permission_reply`
 
-答复某个权限请求。
-
-参数:
-
-- `session_id: string`
-- `request_id: string` — 权限请求 ID(`per_...`)。
-- `decision: "once" | "always" | "reject"` — `once` 本次允许;`always` 始终允许并保存;`reject` 拒绝。
-- `message?: string` — 可选说明。
-
-```json
-{"name": "permission_reply", "arguments": {"session_id": "ses_abc", "request_id": "per_xyz", "decision": "once"}}
-```
+Answer a permission request: `decision` = `once` (allow this time), `always` (allow and save the rule), `reject`. Optional `message`.
 
 ### 6. `form_reply`
 
-提交表单答案。`answer` 的键为字段 `key`,值支持 `string` / `number` / `boolean` / `string[]`。
+Submit a form answer: `answer` is an object keyed by field `key`; values may be string / number / boolean / string[].
 
-参数:`session_id`、`form_id`(`frm_...`)、`answer`(对象)。
+### 7. `list_agents`
 
-```json
-{"name": "form_reply", "arguments": {"session_id": "ses_abc", "form_id": "frm_xyz", "answer": {"name": "foo", "count": 3, "tags": ["a", "b"]}}}
-```
+Read-only listing of all agents and their resolved default models (`model: null` means no explicit model; the run falls back to the location default). This tool provides information only — it never pins models for you.
 
-### 7. `interrupt`
+### 8. `interrupt`
 
-中断指定会话当前正在进行的生成。
-
-```json
-{"name": "interrupt", "arguments": {"session_id": "ses_abc"}}
-```
-
-### 8. `list_agents`
-
-列出全部 agent 及其解析后的默认模型(只读,不修改任何东西):
-
-```json
-{ "count": 12, "agents": [ { "name": "orchestrator", "mode": "primary", "model": {"id": "glm-5.3", "providerID": "zai-coding-plan"} }, ... ] }
-```
-
-用途:读取 agent→模型映射。想创建与某 agent 模型一致的会话时,由调用方显式传 `create_session(model_id="providerID/modelID")`。
+Interrupt the session's current generation. Useful after `chat` returns `timeout`.
 
 ### 9. `pending_interactions`
 
-查询会话当前待处理的人工交互,返回 `{ "permissions": [...], "forms": [...] }`(表单只列出 pending 状态)。不阻塞,适合先探一下会话是否在等授权/填表。
-
-```json
-{"name": "pending_interactions", "arguments": {"session_id": "ses_abc"}}
-```
+Non-blocking check for pending permission requests and forms: `{server, session_id, permissions, forms}`.
 
 ### 10. `list_sessions`
 
-枚举 / 搜索既有会话,支持关键词、排序、目录过滤与游标翻页。拿到 `session_id` 后配合 `chat` 即可恢复之前的话题。
-
-参数(全部可选):
-
-- `search?: string` — 按标题/内容搜索的关键词。
-- `limit?: int` — 返回条数上限,默认 `20`。
-- `order?: "asc" | "desc"` — 按更新时间排序,默认 `desc`。
-- `directory?: string` — 按工作目录过滤。
-- `cursor?: string` — 翻页游标,取自上次返回的 `cursor.next`。
-
-返回:`{ "count": N, "sessions": [ { "id", "title", "agent", "model", "parentID", "time": { "updated", "idle"? } } ], "cursor": { "previous", "next" } }`;缺失字段为 `null`。
-
-```json
-{"name": "list_sessions", "arguments": {"search": "部署", "limit": 20, "order": "desc"}}
-```
+Enumerate / search existing sessions: `search?`, `limit?` (default 20), `order?` (`asc|desc`, default `desc`), `directory?`, `cursor?`. Returns `{count, sessions: [{id, title, agent, model, parentID, time}], cursor}` — combine with `chat` to resume earlier conversations.
 
 ### 11. `compact`
 
-压缩指定会话的上下文,等待压缩结束并返回结果。
-
-参数:`session_id`(必填)、`timeout_secs?`(默认 `120`)。
-
-返回与 `chat` 同构的 `status`:
-
-- `succeeded` — 压缩完成(compaction 消息 `status=completed` 或会话 outcome 终态)。
-- `compaction_failed` — 压缩失败(`compaction status=failed`)。
-- `timeout` — 超时。
-
-```json
-{"name": "compact", "arguments": {"session_id": "ses_abc", "timeout_secs": 120}}
-```
+Compact the session context and wait for completion. Statuses: `succeeded`, `compaction_failed`, `timeout`. Useful when context approaches the limit; you can continue chatting afterwards.
 
 ### 12. `get_context`
 
-查看指定会话的上下文占用(token / 成本)与元信息,配合 `compact` 判断是否需要压缩。
-
-参数:`session_id`(必填)。
-
-返回:`{ "id", "title", "agent", "model", "parentID", "tokens", "cost", "time": { "updated", "idle"? }, "revert" }`;`tokens` / `cost` / `revert` 缺省为 `null`。
-
-```json
-{"name": "get_context", "arguments": {"session_id": "ses_abc"}}
-```
+Context usage and metadata: `{server, id, title, agent, model, parentID, tokens, cost, time, revert}` (`tokens` / `cost` may be null). Pair with `compact` to decide whether to shrink.
 
 ### 13. `delete_session`
 
-删除指定会话。
+Delete a session. ⚠️ **Irreversible**, and **cascades to child sessions** (children return 404 once the parent is deleted).
 
-> ⚠️ **不可逆**:会话一旦删除无法恢复。
-> ⚠️ **级联删除**:删除父会话会一并删除其所有子会话(实测删除父会话后,子会话再访问返回 `404`)。
+### 14. `connect_server`
 
-参数:`session_id`(必填)。
+Register and validate a remote opencode connection (process-lifetime only, never persisted). Validation at creation: unreachable = availability error; no version = compatibility error; version mismatch returns a warning. Credentials: `password_file` (first line) > `password_env` > plaintext `password`; with none given, no `Authorization` header is sent. Returns `{name, url, version, baseline, baseline_check}`.
 
-返回:`{ "ok": true, "session_id": "ses_..." }`(opencode 返回 204 无 body)。
+### 15. `list_servers`
 
-```json
-{"name": "delete_session", "arguments": {"session_id": "ses_abc"}}
-```
+List all current connections (local + dynamic remotes): name, URL, source, version, and baseline-check status. Ensures the local connection is ready (spawning it if needed).
 
-## 权限 / 表单交互流程
+### 16. `disconnect_server`
 
-### 自动模式(默认)
+Remove a dynamically registered remote connection (`local` cannot be removed). Session routes belonging to it are cleared.
 
-`chat` 的 `auto_permission` 默认为 `once`,遇到权限请求会自动答复并继续等待,通常一次调用即可拿到 `succeeded`。
+## Permission and form flows
 
-### 手动模式
+### Automatic mode (default locally)
 
-当希望人工决定是否授权时,使用 `auto_permission: "manual"`:
+`chat` with the default `auto_permission="once"` answers permission requests automatically and keeps waiting — usually one call returns `succeeded`.
 
-1. 调用 `chat(..., auto_permission="manual")`,若遇到权限请求,返回:
+### Manual mode
 
+1. `chat(auto_permission="manual")` returns `needs_permission` with a `requests` list:
    ```json
    {
      "status": "needs_permission",
-     "requests": [
-       {"id": "per_1", "sessionID": "ses_abc", "action": "bash", "resources": ["rm -rf ..."]}
-     ]
+     "server": "local",
+     "session_id": "ses_abc",
+     "requests": [{"id": "per_...", "action": "shell", "resources": ["echo hi"], "save": ["echo *"]}]
    }
    ```
+2. Decide per request and call `permission_reply(session_id, request_id, decision, message?)`.
+3. Call `wait_session(session_id)` to continue. New permission requests surface as `needs_permission` again; the terminal status is `succeeded / failed / interrupted`, after which `get_messages(after_message_id=...)` pulls the incremental reply.
 
-2. 根据 `requests` 内容决定策略,调用 `permission_reply(session_id, request_id, decision, message?)`。
-3. 调用 `wait_session(session_id)` 继续等待。若又出现新的权限请求,会返回 `needs_permission`,重复步骤 2–3;终态返回 `succeeded` / `failed` / `interrupted`,再用 `get_messages(after_message_id=...)` 拉取增量回复。
+> If a request was already handled elsewhere, `permission_reply` may error — just call `wait_session` or `pending_interactions` to re-check state.
 
-### 表单流程
+### Form flow
 
-1. 调用 `chat` 或 `wait_session` 时若遇到表单,返回:
+1. `chat` / `wait_session` returns `needs_form` with field details.
+2. Answer with `form_reply(form_id, answer)`.
+3. Call `wait_session` to continue until terminal.
 
-   ```json
-   {
-     "status": "needs_form",
-     "forms": [
-       {
-         "id": "frm_1",
-         "title": "请选择部署环境",
-         "fields": [
-           {"key": "env", "title": "环境", "type": "string", "required": true,
-            "options": [{"value": "dev", "label": "开发"}, {"value": "prod", "label": "生产"}]}
-         ]
-       }
-     ]
-   }
-   ```
+## Permission rules and action naming
 
-   `fields` 里的 `type` 可能为 `string` / `number` / `integer` / `boolean` / `multiselect` / `external`;`multiselect` 的答案用字符串数组。
+Permission actions match tool names (measured: `shell`, `bash`, `edit`, `write`, `read`, `glob`, `grep`, `webfetch`, `external_directory`, ...); `resource` is the command text or path pattern (e.g. `*`). Rule `effect` is one of `allow / deny / ask`.
 
-2. 调用 `form_reply(session_id, form_id, answer)`,例如 `answer = {"env": "prod"}`。
-3. 调用 `wait_session(session_id)` 继续等待生成完成。
-
-> 提示:若某个权限请求已经被其他途径处理,`permission_reply` 可能返回错误;此时直接调用 `wait_session` 或 `pending_interactions` 重新确认状态即可。
-
-## 权限规则与 action 命名
-
-权限请求 `Permission.Request` 的关键字段:
-
-- `action`:要执行的动作,**命名与工具名一致**。实测出现过的 action 包括:
-  `shell`、`bash`、`edit`、`write`、`read`、`glob`、`grep`、`webfetch`、`external_directory` 等。
-- `resources`:动作作用的对象列表。对命令类工具(`shell`/`bash`)通常是**命令文本**,对文件类工具(`edit`/`write`/`read`/`glob`/`grep`)通常是**路径模式**(如 `*`、`/root/project/**`),`webfetch` 为 URL,`external_directory` 为目录路径。
-- `save?`:可被 `always` 记住的资源列表。
-- `message?`:可选的说明文本。
-
-因此 `permission_reply` 的 `decision` 语义是:`once` 仅本次放行;`always` 放行并把该 `action` + `resource` 规则保存;`reject` 拒绝。
-
-### 在会话上强制把某类动作设为 ask
-
-opencode 的会话支持在 `session.create` 时通过 `permissions` 传入规则(`effect` 可为 `allow` / `deny` / `ask`),用来覆盖默认行为。例如强制所有 shell 命令都必须询问:
+To force `ask` on a session (e.g. to exercise the manual flow), include a ruleset at creation — via the raw API, since `create_session` does not pass permissions through:
 
 ```bash
-curl -u opencode:$OPENCODE_PASSWORD \
-  -H 'Content-Type: application/json' \
-  -X POST http://127.0.0.1:49374/api/session \
-  -d '{
-    "title": "权限演示",
-    "permissions": [
-      {"action": "shell", "resource": "*", "effect": "ask"},
-      {"action": "bash",  "resource": "*", "effect": "ask"}
-    ]
-  }'
+curl -u "opencode:$PASSWORD" -X POST "$URL/api/session" -H 'Content-Type: application/json' \
+  -d '{"title": "perm test", "permissions": [{"action": "shell", "resource": "*", "effect": "ask"}]}'
 ```
 
-等价的 JSON body:
+Then `chat(..., auto_permission="manual")` deterministically exercises `needs_permission`; answer with `permission_reply` and continue with `wait_session`.
 
-```json
-{
-  "title": "权限演示",
-  "permissions": [
-    {"action": "shell", "resource": "*", "effect": "ask"},
-    {"action": "bash",  "resource": "*", "effect": "ask"}
-  ]
-}
-```
+## Verified flows (opencode v2.0.12)
 
-配置后调用 `chat(..., auto_permission="manual")`,即可稳定复现 `needs_permission` 流程;用 `permission_reply` 逐条答复后再 `wait_session` 继续。
+1. **Create + chat**: `create_session` → `chat` → `succeeded` with `assistant_text` / `tools_used`.
+2. **Manual permission loop**: `chat(auto_permission="manual")` → `needs_permission` → `permission_reply(decision="once")` → `wait_session` → terminal.
+3. **Form pipeline**: `chat` / `wait_session` returns `needs_form` (with field details) → `form_reply` → `wait_session` → terminal.
+4. **Automatic permission**: default `auto_permission="once"` approves and continues; a single `chat` returns `succeeded`.
+5. **Connection layer**: explicit-env and MCP-spawned local paths; spawned serve carries a real conversation and dies with its parent; failure classification (dead port = availability, HTML-only service = compatibility, 401 = credentials); duplicate-name and unknown-server errors; session auto-routing; disconnect rules.
+6. **Real remote end-to-end**: `connect_server` with plaintext credentials → remote `create_session` → remote `chat` → remote manual-permission default (blocked, not auto-approved) → `permission_reply` → `wait_session` → incremental `get_messages` → `disconnect_server`.
+7. **Long-session window**: on a 200+ message session, tail-window fetching keeps gate lookup, incremental cursors and `last_message_id` correct.
+8. **Cancellation & concurrency**: `notifications/cancelled` stops polling within 1s; concurrent `pending_interactions` returns in milliseconds while `chat` is in flight.
 
-> 说明:`create_session` 工具当前只透传 `title` / `agent` / `model_id`;若需要自定义 `permissions` 规则,可按上面的例子直接调用 opencode HTTP API 创建会话,拿到 `ses_...` 后继续用本 server 的其他工具。
-
-## 已验证流程
-
-以下链路均在**本机 opencode v2.0.12** 上完成过 live 验证:
-
-1. **创建 + 对话**:`create_session` 创建会话,`chat` 发送 prompt,返回 `status: succeeded` 并带 `assistant_text` / `tools_used`。
-2. **manual 权限全链路**:`chat(auto_permission="manual")` 返回 `needs_permission` → `permission_reply(decision="once")` → `wait_session` 直至终态。
-3. **表单管道**:`chat` / `wait_session` 返回 `needs_form`(含字段详情)→ `form_reply(form_id, answer)` → `wait_session` 直至终态。
-4. **默认自动授权**:`chat` 使用默认 `auto_permission="once"`,遇到权限请求自动放行并继续,一次调用即返回 `succeeded`。
-
-> **本轮为 A 批次**:新增 `list_sessions` / `compact` / `get_context` / `delete_session` 四个工具,并为 `chat` 增加 `delivery` / `files` 参数、为 `create_session` 增加 `location` 参数。以上第 1–4 项为既有 live 验证;A 批次新增能力的 live 网络验证待后续批次执行(本轮只做编译与冒烟测试)。
-
-## 测试
-
-冒烟测试(仅 MCP 握手 + `tools/list`,不发任何网络请求):
+## Testing
 
 ```bash
-cd /root/opencode-mcp
-python3 -m py_compile server.py test_client.py
-python3 test_client.py
+python3 test_client.py                 # handshake + tools/list assertion (16 tools)
+python3 test_client.py --chat "hello"  # adds a real create_session + chat round-trip
 ```
 
-预期输出 13 个工具名并以退出码 0 结束。
+The smoke test spawns its own server process; with `OPENCODE_URL`/`OPENCODE_PASSWORD` unset it exercises the MCP-spawned local path directly.
 
-带真实对话测试(需要本机 opencode 正在运行):
+## Files
 
-```bash
-python3 test_client.py --chat "用一句话介绍你自己"
-```
-
-## 文件
-
-- `server.py` — MCP stdio server 主文件。
-- `test_client.py` — 冒烟测试客户端。
-- `README.md` — 本文件。
+- `server.py` — the MCP server (stdlib only).
+- `test_client.py` — smoke test client.
+- `README.md` / `README.zh-CN.md` — this document, English and Chinese.
+- `DESIGN-remote-connections.md` — design record for the multi-connection model.
