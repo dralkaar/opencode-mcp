@@ -28,10 +28,12 @@ python3 -m py_compile server.py test_client.py
 python3 test_client.py
 ```
 
-预期输出 13 个工具名并以退出码 0 结束。
+预期输出 16 个工具名并以退出码 0 结束。
 
 带真实对话测试(需要本机 opencode 正在运行):
 
 ```bash
 python3 test_client.py --chat "用一句话介绍你自己"
 ```
+
+场景套件位于 [`tests/`](../tests/README.md):核心交互流程、子会话/子树场景、专属 serve 的生命周期路径。纯 Python 标准库,输出 `PASS` / `FAIL` / `SKIP`;需要额外环境(已有 opencode 服务端、远端实例、具备委派能力的 agent)的场景一律 **SKIP 而非失败**,并通过 `tests/README.md` 中记录的 `OPENCODE_TEST_*` 变量启用。

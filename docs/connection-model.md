@@ -24,7 +24,5 @@ Part of the [opencode-mcp](../README.md) documentation.
 
 ## Concurrency and cancellation
 
-Part of the [opencode-mcp](../README.md) documentation.
-
 - Each JSON-RPC request is handled in its own worker thread (`OPENCODE_MCP_WORKERS`, default 4). Long-blocking calls such as `chat` / `wait_session` never block other tool calls.
 - MCP-standard `notifications/cancelled` is honored: cancelling `chat` / `wait_session` stops polling within 1 second (a single in-flight HTTP request can take up to its 30-second timeout to unwind).

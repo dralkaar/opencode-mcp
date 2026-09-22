@@ -32,8 +32,6 @@ Part of the [opencode-mcp](../README.md) documentation.
 
 ## Permission rules and action naming
 
-Part of the [opencode-mcp](../README.md) documentation.
-
 Permission actions match tool names (measured: `shell`, `bash`, `edit`, `write`, `read`, `glob`, `grep`, `webfetch`, `external_directory`, ...); `resource` is the command text or path pattern (e.g. `*`). Rule `effect` is one of `allow / deny / ask`.
 
 To force `ask` on a session (e.g. to exercise the manual flow), include a ruleset at creation — via the raw API, since `create_session` does not pass permissions through:

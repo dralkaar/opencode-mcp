@@ -19,11 +19,15 @@ All verified live against opencode v2.0.12:
 
 ## Testing
 
-Part of the [opencode-mcp](../README.md) documentation.
-
 ```bash
 python3 test_client.py                 # handshake + tools/list assertion (16 tools)
 python3 test_client.py --chat "hello"  # adds a real create_session + chat round-trip
 ```
+
+The scenario suite lives in [`tests/`](../tests/README.md): the core interaction flows, the
+subagent/subtree scenarios, and the spawned-serve lifecycle paths. It is plain stdlib Python
+and reports `PASS` / `FAIL` / `SKIP`; scenarios that need an extra environment (an existing
+opencode server, a remote instance, a delegation-capable agent) are skipped rather than failed,
+and are enabled through `OPENCODE_TEST_*` variables documented in `tests/README.md`.
 
 The smoke test spawns its own server process; with `OPENCODE_URL`/`OPENCODE_PASSWORD` unset it exercises the MCP-spawned local path directly.

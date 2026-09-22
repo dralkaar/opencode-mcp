@@ -86,4 +86,5 @@ All tools accept an optional `server` parameter; calls carrying a `session_id` a
 - [Subagent-aware waiting in multi-agent sessions](docs/subagent-waiting.md) · [中文](docs/subagent-waiting.zh-CN.md)
 - [Tool reference](docs/tools.md) · [中文](docs/tools.zh-CN.md)
 - [Verified flows and testing](docs/verification.md) · [中文](docs/verification.zh-CN.md)
+- [Live scenario test suites](tests/README.md) · [中文](tests/README.zh-CN.md)
 - [Design record: remote connections](DESIGN-remote-connections.md) · [中文](DESIGN-remote-connections.zh-CN.md)

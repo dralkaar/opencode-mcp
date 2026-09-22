@@ -1120,9 +1120,13 @@ def _autoreply_subtree_permissions(conn, snap, decision, replied):
 
 
 def _enrich_forms(conn, forms):
-    """The global /api/form list omits field detail; refetch per owning session so replies stay answerable.
+    """Defensive fallback: refetch per owning session when the global list lacks field detail.
 
-    Best-effort: on any failure the original list is returned unchanged.
+    Measured on the development baseline: /api/form already returns `fields` and `sessionID`, and
+    /api/session/{id}/form does the same, so the early return below is the path actually taken and
+    the refetch is unreachable there. It is kept for other builds whose global list is thinner, and
+    it re-adds the owner id because the per-session shape may omit it (this baseline happens to
+    include it as well). Best-effort: on any failure the original list is returned unchanged.
     """
     if not forms:
         return forms
