@@ -25,6 +25,7 @@ Each suite is standalone and prints one line per scenario plus a summary line:
 python3 tests/live_core_test.py
 python3 tests/live_subagent_test.py
 python3 tests/live_lifecycle_test.py
+python3 tests/security_review_test.py   # no opencode server needed
 ```
 
 The process exit code is `1` only when at least one scenario **fails**. Skips
@@ -99,6 +100,21 @@ With a clean environment the MCP spawns its own `serve`. The suite forces that
 path via `list_servers`, locates the child process and asserts it is gone within
 a few seconds for each shutdown path: stdin EOF, `SIGTERM` and `SIGINT`. The
 whole suite reports SKIP when `opencode` is not on `PATH`.
+
+### `security_review_test.py`
+
+Offline verification of the `connect_server` credential / URL policy and the
+DoS bounds (response size cap, stdin line cap, worker clamp). It spawns the
+MCP over stdio and asserts every rejection **before** any network connection
+is attempted, so it runs without an opencode instance:
+
+- `password_file` / `password_env` are rejected (no LLM-directed file/env
+  reads) and removed from the tool schema.
+- Non-http(s) schemes, schemeless URLs and control characters are rejected.
+- Loopback / private / link-local (incl. cloud metadata) / reserved /
+  multicast IPv4 and IPv6 literal hosts are rejected; public hosts and
+  hostnames pass validation and reach the availability gate.
+- `MAX_RESPONSE_BYTES`, `MAX_STDIN_LINE`, `MAX_WORKERS` exist and behave.
 
 ## Skip behaviour
 
