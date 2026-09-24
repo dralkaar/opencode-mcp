@@ -112,12 +112,37 @@ is attempted, so it runs without an opencode instance:
   reads) and removed from the tool schema.
 - Non-http(s) schemes, schemeless URLs and control characters are rejected.
 - Loopback / private / link-local (incl. cloud metadata) / reserved /
-  multicast IPv4 and IPv6 literal hosts are rejected; public hosts and
-  hostnames pass validation and reach the availability gate.
+  multicast IPv4 and IPv6 literal hosts are rejected, including non-standard
+  encodings the system resolver accepts (decimal / hex / octal / short-form);
+  public hosts and hostnames pass validation and reach the availability gate.
+- Fail-closed DNS: a mixed public+private record set is rejected; a record set
+  with nothing parseable as an address is rejected (monkeypatched
+  `getaddrinfo`, no real DNS).
 - `MAX_RESPONSE_BYTES`, `MAX_STDIN_LINE`, `MAX_WORKERS` exist and behave.
 
-## Skip behaviour
+### `regression_review_test.py`
 
+Second-round regression suite (independent review, 2026-09-24). Uses local
+`ThreadingHTTPServer` instances on 127.0.0.1 only (plus monkeypatched DNS for
+unit-level checks); no opencode instance required:
+
+- **[HIGH]** 302-redirect SSRF: a local server that 302-redirects
+  `/api/info` to an internal tracking target must **never** be followed —
+  the no-redirect opener raises `HTTPError` and the internal target receives
+  zero requests (the `Authorization` header is not replayed).
+- **[HIGH]** uncapped error body: a 404 with a 2 MiB body is handled with a
+  short error (body read capped at 64 KiB); a 200 with a lying 4 MiB
+  `Content-Length` is rejected **before** any read.
+- **[MED]** cap-abort classification: `check_response_size` raises `[other]`,
+  and `_ensure_version` re-raises `OpenCodeError` verbatim (never reclassified
+  as `[availability]`).
+- **[MED]** re-validation at request time: `http_request` re-runs
+  `_validate_remote_url` per request on dynamic connections (closes the
+  DNS-rebinding window) and exempts local connections.
+- **[LOW]** `_is_disallowed_ip` full table: CGNAT 100.64/10, 6/8, 7/8,
+  IPv4-mapped and IPv4-compatible IPv6 unwrapping.
+
+## Skip behaviour
 - `opencode` not on `PATH` and no `OPENCODE_TEST_URL` → the local scenarios and
   the lifecycle suite report SKIP.
 - No `OPENCODE_TEST_URL` → the explicit-env scenario reports SKIP; the
