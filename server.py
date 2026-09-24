@@ -17,6 +17,7 @@ import os
 import random
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -436,7 +437,54 @@ def _validate_remote_url(base_url):
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
-        return  # hostname (not a literal IP): not blocklisted here
+        # Hostname (not an IP literal). Two things to check:
+        #
+        # 1. Non-standard IP encodings. The system resolver (getaddrinfo)
+        #    interprets decimal ("2130706433"), hex ("0x7f.0.0.1"), octal
+        #    ("0177.0.0.1") and short-form ("127.1") IPv4 notations, but
+        #    ipaddress.ip_address() rejects them -- so they would pass the
+        #    literal-IP blocklist above and still resolve to a private
+        #    address (all of the forms above resolve to 127.0.0.1). Resolve
+        #    the name and block it when every record is a blocked address.
+        #
+        # 2. Hostnames that resolve to private addresses (e.g. "localhost").
+        #    Resolve all A/AAAA records; when the name resolves (at least
+        #    partially) block it unless every record is a public address.
+        #    A temporary DNS failure is NOT blocked here: the first real
+        #    request then fails with a clean [availability] error.
+        #
+        # Residual (documented in docs/connection-model.md): the check runs at
+        # registration time; a DNS-rebinding name (public record now, private
+        # record later) is not caught. connect_server is an operator-facing,
+        # low-frequency call; if a deployment registers names from dynamic
+        # input, re-resolve at request time.
+        try:
+            records = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80))
+        except (socket.gaierror, OSError):
+            return  # unresolvable now; the first request reports [availability]
+        resolved = set()
+        for rec in records:
+            try:
+                resolved.add(ipaddress.ip_address(rec[4][0]))
+            except (ValueError, IndexError, TypeError):
+                continue
+        if resolved and all(
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+            for ip in resolved
+        ):
+            raise OpenCodeError(
+                "url host %r resolves to private / loopback / link-local / reserved "
+                "addresses only and cannot be registered as a remote connection "
+                "(connect_server is for remote opencode servers only); use the "
+                "OPENCODE_URL / OPENCODE_PASSWORD environment variables to point this "
+                "MCP at a server the operator runs locally" % host
+            )
+        return
     if (
         ip.is_loopback
         or ip.is_private

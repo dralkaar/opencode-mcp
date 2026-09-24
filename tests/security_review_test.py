@@ -145,14 +145,19 @@ def main():
     check("reject file://", rejects("file:///home/clavius/.hermes/secrets/vllm27b.api.key"))
     check("reject schemeless", rejects("127.0.0.1:4096"))
     check("reject loopback", rejects("http://127.0.0.1:4096"))
-    check("reject localhost name is NOT auto-blocked (hostname, not literal IP) -- expect allowed",
-          not rejects("http://localhost:4096"))
+    check("reject localhost (resolves to loopback)", rejects("http://localhost:4096"))
     check("reject private 10.x", rejects("http://10.100.10.40:4096"))
     check("reject private 192.168.x", rejects("http://192.168.4.1:4096"))
     check("reject link-local/metadata 169.254.169.254", rejects("http://169.254.169.254/latest/meta-data/"))
     check("reject IPv6 loopback", rejects("http://[::1]:4096"))
     check("reject IPv6 ULA", rejects("http://[fd12::1]:4096"))
-    check("allow public hostname (no network in this check)", not rejects("https://opencode.example.com:4096"))
+    check("reject IPv4-mapped IPv6 loopback", rejects("http://[::ffff:127.0.0.1]:4096"))
+    check("reject decimal-encoded IPv4 (resolves to 127.0.0.1)", rejects("http://2130706433:4096"))
+    check("reject hex-encoded IPv4 (resolves to 127.0.0.1)", rejects("http://0x7f.0.0.1:4096"))
+    check("reject octal-encoded IPv4 (resolves to 127.0.0.1)", rejects("http://0177.0.0.1:4096"))
+    check("reject short-form IPv4 (resolves to 127.0.0.1)", rejects("http://127.1:4096"))
+    check("allow unresolvable public hostname (fails later at the availability gate)",
+          not rejects("http://does-not-exist.invalid:4096"))
     check("reject control char in url", rejects("http://1.2.3.4\x00:4096"))
 
     # ---- live server: connect_server credential + URL policy over JSON-RPC ----
