@@ -335,13 +335,17 @@ def _spawn_local_serve():
         password = (
             base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
         )
-        env = dict(os.environ)
-        env["OPENCODE_SERVER_PASSWORD"] = password
-        # The spawned serve inherits the full MCP environment as-is (including any API keys
-        # present in it, e.g. LLM / provider keys). If opencode (or a plugin it loads) were
-        # compromised, the entire host environment would be readable from its process.
-        # TODO (follow-up, requires a behavioral test against the current opencode build):
-        # spawn with a minimal environment (PATH + OPENCODE_SERVER_PASSWORD) instead.
+        # Minimal spawn environment (behavioral test against opencode v2.0.16, 2026-09-24:
+        # a locally spawned `opencode serve` with only PATH + HOME + OPENCODE_SERVER_PASSWORD
+        # starts, authenticates, and completes a real model turn). PATH is needed to find the
+        # opencode binary; HOME so it can read its own config; everything else (LLM / provider
+        # API keys etc.) is deliberately NOT passed, so a compromised opencode or a plugin it
+        # loads cannot read the whole host environment from its process.
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+            "OPENCODE_SERVER_PASSWORD": password,
+        }
         try:
             proc = subprocess.Popen(
                 ["opencode", "serve", "--port", str(port)],
@@ -719,8 +723,9 @@ def http_request(conn, method, path, body=None, query=None):
     if not conn.is_local:
         # Re-validation at request time: connect_server validated the url at registration,
         # but a DNS name can rebind between then and now (public record -> 169.254.169.254).
-        # Re-resolving per request closes the rebinding window without adding a network hop
-        # for the (already-validated) IP-literal case.
+        # Re-resolving per request narrows the rebinding window to this one in-flight
+        # request without adding a network hop for the (already-validated) IP-literal case.
+        # Full elimination would require pinning the validated IP literal for the connect.
         _validate_remote_url(conn.base_url)
     url = conn.base_url + path
     if query:
@@ -2842,7 +2847,8 @@ def main():
 
         # Cancellation notification: handled immediately in the reader thread, not sent to the thread pool
         if method == "notifications/cancelled":
-            cancelled_id = (message.get("params") or {}).get("requestId")
+            params = message.get("params")
+            cancelled_id = params.get("requestId") if isinstance(params, dict) else None
             if cancelled_id is not None:
                 with _STATE_LOCK:
                     _CANCELLED.add(cancelled_id)

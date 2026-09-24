@@ -137,10 +137,16 @@ unit-level checks); no opencode instance required:
   and `_ensure_version` re-raises `OpenCodeError` verbatim (never reclassified
   as `[availability]`).
 - **[MED]** re-validation at request time: `http_request` re-runs
-  `_validate_remote_url` per request on dynamic connections (closes the
-  DNS-rebinding window) and exempts local connections.
+  `_validate_remote_url` per request on dynamic connections (narrows the
+  DNS-rebinding window to a single in-flight request) and exempts local connections.
 - **[LOW]** `_is_disallowed_ip` full table: CGNAT 100.64/10, 6/8, 7/8,
   IPv4-mapped and IPv4-compatible IPv6 unwrapping.
+- **[MED]** (final review) minimal spawn env: `_spawn_local_serve` must not
+  inherit the full process environment (no `dict(os.environ)`), and must set
+  exactly `PATH` + `HOME` + `OPENCODE_SERVER_PASSWORD`.
+- **[LOW]** (final review) hostile `notifications/cancelled` with non-dict or
+  missing `params` must not kill the stdin reader thread; the MCP process must
+  stay alive and still answer `tools/list` afterwards.
 
 ## Skip behaviour
 - `opencode` not on `PATH` and no `OPENCODE_TEST_URL` → the local scenarios and

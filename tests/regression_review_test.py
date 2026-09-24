@@ -11,6 +11,9 @@ Each test targets a specific finding:
   5. [MED]    cap-abort misclassified as [availability] in _ensure_version.
   6. [MED]    rebinding window: http_request must re-validate the url per request.
   7. [LOW]    _is_disallowed_ip gaps: CGNAT 100.64/10, 6/8, 7/8, IPv6-unwrap.
+  8. [MED]    (final review) spawn env must be minimal, not dict(os.environ).
+  9. [LOW]    (final review) non-dict `notifications/cancelled` params must not kill
+              the stdin reader (process DoS).
 
 Self-contained: local ThreadingHTTPServer on 127.0.0.1 only; no external network
 except a couple of public-DNS lookups that are monkeypatched in the unit checks.
@@ -18,12 +21,15 @@ Run:  python3 tests/regression_review_test.py
 """
 
 import importlib.util
+import inspect
 import ipaddress
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -292,6 +298,60 @@ def main():
         if got != want:
             bad.append("%s got=%s want=%s" % (s, got, want))
     check("_is_disallowed_ip full table (incl. CGNAT/6-8/IPv6-unwrap)", not bad, "; ".join(bad))
+
+    # -- 8. [MED, final review] spawn env must be minimal ----------------------
+    spawn_src = inspect.getsource(mod._spawn_local_serve)
+    check("spawn env: no full-environment inheritance (no dict(os.environ) in spawn)",
+          "dict(os.environ)" not in spawn_src and "os.environ)" not in spawn_src.split("env = {")[0][-400:] if "env = {" in spawn_src else "dict(os.environ)" not in spawn_src)
+    check("spawn env: OPENCODE_SERVER_PASSWORD is injected",
+          '"OPENCODE_SERVER_PASSWORD": password' in spawn_src)
+    check("spawn env: only PATH/HOME/password keys are set",
+          all(k in spawn_src for k in ('"PATH"', '"HOME"', '"OPENCODE_SERVER_PASSWORD"'))
+          and spawn_src.count("os.environ.get") == 2)
+
+    # -- 9. [LOW, final review] hostile `notifications/cancelled` cannot kill
+    # the stdin reader (non-dict / missing params used to raise AttributeError,
+    # killing the whole MCP process = DoS) -------------------------------------
+    p = subprocess.Popen([sys.executable, SERVER_PATH], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, encoding="utf-8", bufsize=1)
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                              "params": [1, 2, 3]}) + "\n")
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                              "params": "not-a-dict"}) + "\n")
+    p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
+                              "params": {}}) + "\n")
+    p.stdin.flush()
+    tools_seen = False
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            line = p.stdout.readline()
+            if not line:
+                break
+            try:
+                m = json.loads(line)
+            except Exception:
+                continue
+            if m.get("id") == 1 and isinstance(m.get("result"), dict) \
+                    and "tools" in m["result"]:
+                tools_seen = True
+                break
+    except Exception:
+        pass
+    alive = p.poll() is None
+    try:
+        p.stdin.close()
+    except Exception:
+        pass
+    rc = p.wait(timeout=5) if alive else p.returncode
+    try:
+        p.stdout.close()
+    except Exception:
+        pass
+    check("hostile cancelled (non-dict params) does not kill the process", alive or rc in (0,),
+          "rc=%r" % (rc,))
+    check("MCP still answers tools/list after hostile cancelled", tools_seen)
 
     print("\n%d passed, %d failed" % (PASS, FAIL))
     return 1 if FAIL else 0
